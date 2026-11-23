@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GhostPixel Bot Clean
 // @namespace    https://github.com/Fox3225/GeoPixelsBotClean
-// @version      1.1.10
+// @version      1.1.11
 // @description  Script GeoPixels pour peindre des images fantômes, synchroniser la progression, recevoir une notification de fin, gérer les priorités de couleurs, acheter les couleurs manquantes et augmenter la capacité d’énergie.
 // @author       Fox3225 + Codex
 // @match        https://geopixels.net/*
@@ -22,18 +22,34 @@
 	"use strict";
 
 	const win = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
-	const VERSION = "1.1.10";
+	const VERSION = "1.1.11";
 	const ACCOUNT_MONITOR_URL = "http://127.0.0.1:47631/connect";
 	const TILE_SIZE = 1000;
 	const TILE_BATCH_SIZE = 9;
 	const MAX_PIXELS_PER_REQUEST = 5000;
 	const REQUEST_PAUSE_MS = 1200;
 	const EMPTY_ENERGY_PAUSE_MIN_MS = 15000;
+	const ENERGY_POLL_MAX_MS = 60000;
+	const PAINT_REQUEST_TIMEOUT_MS = 15000;
 	const PURCHASE_RESULT_TIMEOUT_MS = 12000;
 	const COLOR_PURCHASE_PAUSE_MS = 1200;
 	const MAX_COLOR_PURCHASES_PER_RUN = 5;
 	const ENERGY_CAPACITY_PURCHASE_CHUNK = 50;
 	const SETTINGS_KEY = "ghostpixel_clean_settings";
+	const DEFAULT_ENERGY_SETTINGS = {
+		energyMode: "salvos",
+		startEnergyUnit: "percent",
+		startEnergyThreshold: 100,
+		resumeEnergyUnit: "percent",
+		resumeEnergyThreshold: 100,
+		energyReserve: 0,
+		maxBatchSize: 0,
+	};
+	const SALVO_LABELS = {
+		start: "Attente du démarrage",
+		active: "Salve en cours",
+		resume: "Attente de la reprise",
+	};
 	const STATUS_LABELS = {
 		idle: "Prêt",
 		syncing: "Synchronisation",
@@ -53,11 +69,14 @@
 
 	const state = {
 		running: false,
+		syncing: false,
 		stopRequested: false,
 		placedThisRun: 0,
 		totalTargets: 0,
 		remaining: 0,
-		localEnergy: null,
+		energy: null,
+		salvoPhase: "start",
+		nextBatchSize: 0,
 		serverTimestamp: 0,
 		status: "idle",
 		message: "Prêt",
@@ -278,6 +297,7 @@
 					const readResponse = async (response) => ({
 						ok: response.ok,
 						status: response.status,
+						retryAfter: response.headers.get("Retry-After"),
 						text: await response.text().catch(() => "")
 					});
 					const requestUrlOf = (input) => {
@@ -363,7 +383,7 @@
 						value: async (pixels) => {
 							const auth = authPayload();
 							if (auth.error) {
-								return { ok: false, status: 0, text: auth.error, debug: auth.debug };
+								return { ok: false, status: 0, needsSession: true, text: auth.error, debug: auth.debug };
 							}
 							const cleanPixels = (Array.isArray(pixels) ? pixels : [])
 								.map((pixel) => ({
@@ -385,10 +405,11 @@
 								return await readResponse(await fetch("/PlacePixels", {
 									method: "POST",
 									headers: { "Content-Type": "application/json" },
-									body: JSON.stringify({ ...auth, Pixels: cleanPixels })
+									body: JSON.stringify({ ...auth, Pixels: cleanPixels }),
+									signal: AbortSignal.timeout(${PAINT_REQUEST_TIMEOUT_MS})
 								}));
 							} catch (error) {
-								return { ok: false, status: 0, text: error && error.message ? error.message : String(error) };
+								return { ok: false, status: 0, requestUncertain: true, text: String(error) };
 							}
 						}
 					});
@@ -422,19 +443,27 @@
 						value: async () => {
 							const auth = authPayload();
 							if (auth.error) {
-								return { ok: false, status: 0, text: auth.error, debug: auth.debug, data: null };
+								return { ok: false, status: 0, needsSession: true, text: auth.error, debug: auth.debug, data: null };
 							}
 							try {
 								const response = await fetch("/GetUserData", {
 									method: "POST",
 									headers: { "Content-Type": "application/json" },
-									body: JSON.stringify({ userId: auth.UserId, token: auth.Token })
+									body: JSON.stringify({ userId: auth.UserId, token: auth.Token }),
+									signal: AbortSignal.timeout(${PAINT_REQUEST_TIMEOUT_MS})
 								});
 								const text = await response.text().catch(() => "");
 								let data = null;
 								try { data = JSON.parse(text); } catch {}
 								if (response.ok && data) applyUserData(data);
-								return { ok: response.ok, status: response.status, text, data };
+								return {
+									ok: response.ok,
+									status: response.status,
+									retryAfter: response.headers.get("Retry-After"),
+									serverDate: response.headers.get("Date"),
+									text,
+									data
+								};
 							} catch (error) {
 								return {
 									ok: false,
@@ -559,6 +588,7 @@
 
 	function loadSettings() {
 		const fallback = {
+			...DEFAULT_ENERGY_SETTINGS,
 			includeFreeColors: true,
 			includeTransparent: false,
 			ignoredColors: [],
@@ -572,6 +602,7 @@
 		};
 		try {
 			const loaded = { ...fallback, ...JSON.parse(storageGet(SETTINGS_KEY) || "{}") };
+			Object.assign(loaded, normalizeEnergySettings(loaded));
 			loaded.ignoredColors = Array.isArray(loaded.ignoredColors)
 				? loaded.ignoredColors.map(toColorId).filter((id) => id !== null)
 				: [];
@@ -587,6 +618,23 @@
 		} catch {
 			return fallback;
 		}
+	}
+
+	function normalizeEnergySettings(values) {
+		const startEnergyUnit = values.startEnergyUnit === "absolute" ? "absolute" : "percent";
+		const resumeEnergyUnit = values.resumeEnergyUnit === "absolute" ? "absolute" : "percent";
+		const threshold = (value, unit) =>
+			clampPositiveInt(value, 100, unit === "percent" ? 100 : Number.MAX_SAFE_INTEGER);
+		const nonnegative = (value) => Number.isSafeInteger(Number(value)) ? Math.max(0, Number(value)) : 0;
+		return {
+			energyMode: values.energyMode === "continuous" ? "continuous" : "salvos",
+			startEnergyUnit,
+			startEnergyThreshold: threshold(values.startEnergyThreshold, startEnergyUnit),
+			resumeEnergyUnit,
+			resumeEnergyThreshold: threshold(values.resumeEnergyThreshold, resumeEnergyUnit),
+			energyReserve: nonnegative(values.energyReserve),
+			maxBatchSize: Math.min(MAX_PIXELS_PER_REQUEST, nonnegative(values.maxBatchSize)),
+		};
 	}
 
 	function saveSettings() {
@@ -811,20 +859,20 @@
 		return Math.max(0, Math.floor(Number(data.pixels) / 5));
 	}
 
-	function energyFromUserData(data) {
-		if (!data) return null;
-		const energy = Number(data.energy);
-		const maxEnergy = Number(data.maxEnergy);
-		const energyRate = Number(data.energyRate);
-		const checkedTick = Number(data.checkedTick);
-		if (![energy, maxEnergy, energyRate, checkedTick].every(Number.isFinite) || energyRate <= 0) {
-			return null;
-		}
-		if (energy > maxEnergy) return Math.max(0, Math.floor(energy));
-
-		const now = Math.floor(Date.now() / 1000);
-		const regenerated = Math.max(0, Math.floor((now - checkedTick) / energyRate));
-		return Math.max(0, Math.floor(Math.min(energy + regenerated, maxEnergy)));
+	function energyFromUserData(data, serverDate) {
+		if (data?.energy == null || data.energy === "") return null;
+		const energy = Math.floor(Number(data.energy));
+		if (!Number.isSafeInteger(energy) || energy < 0) return null;
+		const maxEnergy = Math.floor(Number(data.maxEnergy));
+		const capacity = Number.isSafeInteger(maxEnergy) && maxEnergy > 0 ? maxEnergy : null;
+		const rate = Number(data.energyRate);
+		const tick = Number(data.checkedTick);
+		const serverSeconds = Math.floor(Date.parse(serverDate) / 1000);
+		const canEstimate = capacity !== null && energy < capacity &&
+			Number.isFinite(rate) && rate > 0 && Number.isSafeInteger(tick) && tick > 0 &&
+			serverSeconds >= tick;
+		const current = canEstimate ? Math.min(capacity, energy + Math.floor((serverSeconds - tick) / rate)) : energy;
+		return { current, capacity, rate };
 	}
 
 	function readCachedAvailablePixels() {
@@ -873,28 +921,37 @@
 		return readCachedAvailablePixels();
 	}
 
-	async function fetchCurrentEnergy() {
+	async function fetchEnergySnapshot() {
 		installPageBridge();
-		if (typeof win.__gpcGetUserData === "function") {
-			try {
-				const result = await win.__gpcGetUserData();
-				if (result && result.ok) {
-					const energy = energyFromUserData(result.data);
-					if (energy !== null) {
-						state.localEnergy = energy;
-						return energy;
-					}
-				}
-			} catch {}
+		try {
+			let result;
+			if (typeof win.__gpcGetUserData === "function") result = await win.__gpcGetUserData();
+			if (!result || result.needsSession) {
+				const auth = getAuthPayload();
+				if (!auth.token || !Number.isFinite(auth.userId)) return { status: 401 };
+				const response = await fetch("/GetUserData", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ userId: auth.userId, token: String(auth.token) }),
+					signal: AbortSignal.timeout(PAINT_REQUEST_TIMEOUT_MS),
+				});
+				result = {
+					ok: response.ok,
+					status: response.status,
+					retryAfter: response.headers.get("Retry-After"),
+					serverDate: response.headers.get("Date"),
+					data: response.ok ? await response.json() : null,
+				};
+			}
+			return {
+				status: result.status,
+				retryAfter: result.retryAfter,
+				energy: result.ok ? energyFromUserData(result.data, result.serverDate) : null,
+			};
+		} catch (error) {
+			log("warn", "Lecture de l’énergie impossible.", error);
+			return { status: 0 };
 		}
-
-		const fromUserData = energyFromUserData(readGlobal("userData"));
-		if (fromUserData !== null) {
-			state.localEnergy = fromUserData;
-			return fromUserData;
-		}
-
-		return readEnergy();
 	}
 
 	async function connectAccountMonitor() {
@@ -1101,6 +1158,8 @@
 		return {
 			ok: !!result.ok,
 			status: Number.isFinite(status) ? status : 0,
+			retryAfter: typeof result.retryAfter === "string" ? result.retryAfter : null,
+			needsSession: result.needsSession === true,
 			text: typeof result.text === "string" ? result.text : "",
 			requestUncertain: result.requestUncertain === true,
 			...extra,
@@ -1544,8 +1603,11 @@
 			if (remaining > 0) await delay(COLOR_PURCHASE_PAUSE_MS);
 		}
 
-		state.localEnergy = null;
+		state.energy = null;
+		const reading = await fetchEnergySnapshot();
+		if (!state.running && reading.energy) state.energy = reading.energy;
 		setStatus("done", "Capacité d’énergie augmentée de " + (bought * 5) + " unités.");
+		updateEnergyDisplay();
 		return true;
 	}
 
@@ -1662,6 +1724,7 @@
 		const response = await fetch("/GetPixelsCached", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
+			signal: AbortSignal.timeout(PAINT_REQUEST_TIMEOUT_MS),
 			body: JSON.stringify({
 				Tiles: tileCoords.map((tile) => ({
 					x: tile.x,
@@ -1727,21 +1790,37 @@
 	}
 
 	function readEnergy() {
-		const observed = readNumberGlobal("currentEnergy");
-		if (state.localEnergy === null) return Math.max(0, Math.floor(observed || 0));
-		if (observed !== null && observed > state.localEnergy) state.localEnergy = Math.floor(observed);
-		return Math.max(0, Math.floor(state.localEnergy));
+		if (state.energy) return state.energy;
+		const capacity = Math.floor(readNumberGlobal("maxEnergy"));
+		const current = readNumberGlobal("currentEnergy");
+		return {
+			current: current === null ? null : Math.max(0, Math.floor(current)),
+			capacity: capacity > 0 ? capacity : null,
+			rate: readNumberGlobal("energyRate"),
+		};
 	}
 
-	function markEnergySpent(amount, previousEnergy) {
-		const base = state.localEnergy !== null ? state.localEnergy : Math.floor(previousEnergy || 0);
-		state.localEnergy = Math.max(0, base - amount);
+	function getEnergyThreshold(capacity) {
+		const starting = state.salvoPhase === "start";
+		const unit = starting ? settings.startEnergyUnit : settings.resumeEnergyUnit;
+		const configured = starting ? settings.startEnergyThreshold : settings.resumeEnergyThreshold;
+		if (unit === "percent" && capacity === null) return null;
+		const threshold = unit === "percent" ? Math.ceil(capacity * configured / 100) : configured;
+		return Math.max(threshold, settings.energyReserve + 1);
 	}
 
-	function readEnergyRateMs() {
-		const seconds = readNumberGlobal("energyRate");
-		const safeSeconds = Number.isFinite(seconds) && seconds > 0 ? seconds : 60;
-		return Math.max(EMPTY_ENERGY_PAUSE_MIN_MS, safeSeconds * 1000);
+	function energyPollDelay(energy, threshold) {
+		const missing = Math.max(1, threshold - (energy?.current ?? 0));
+		const rate = energy?.rate;
+		const delayMs = rate > 0 ? missing * rate * 1000 : ENERGY_POLL_MAX_MS;
+		return Math.min(ENERGY_POLL_MAX_MS, Math.max(EMPTY_ENERGY_PAUSE_MIN_MS, delayMs));
+	}
+
+	function rateLimitDelay(retryAfter) {
+		const waitMs = /^\d+$/.test(retryAfter)
+			? Number(retryAfter) * 1000
+			: Date.parse(retryAfter) - Date.now();
+		return waitMs > 0 ? Math.max(REQUEST_PAUSE_MS, waitMs) : EMPTY_ENERGY_PAUSE_MIN_MS;
 	}
 
 	function formatDuration(seconds) {
@@ -1755,10 +1834,10 @@
 	}
 
 	function estimateEta(remaining) {
-		const currentEnergy = readEnergy();
-		const missingEnergy = Math.max(0, remaining - currentEnergy);
-		const rateSeconds = readEnergyRateMs() / 1000;
-		return formatDuration(missingEnergy * rateSeconds);
+		const { current, rate } = readEnergy();
+		if (current === null || !(rate > 0)) return "—";
+		const available = Math.max(0, current - settings.energyReserve);
+		return formatDuration(Math.max(0, remaining - available) * rate);
 	}
 
 	async function sendPixelBatch(targets) {
@@ -1778,52 +1857,22 @@
 			return { ok: false, status: 0, text: "Aucun pixel valide à envoyer." };
 		}
 
-		let bridgeResult = null;
 		installPageBridge();
+		if (state.stopRequested) return null;
 		if (typeof win.__gpcPlacePixels === "function") {
 			try {
-				bridgeResult = normalizeEndpointResult(await win.__gpcPlacePixels(pixels));
-				if (bridgeResult && bridgeResult.ok) {
-					for (const target of targets) boardColors.set(target.key, target.colorId);
-					state.placedThisRun += targets.length;
-					return bridgeResult;
-				}
-				if (bridgeResult && bridgeResult.status !== 0) {
-					log("warn", "Échec de l’envoi des pixels via la page", {
-						status: bridgeResult.status,
-						text: bridgeResult.text,
-						pixelCount: pixels.length,
-						firstPixel: pixels[0],
-					});
-					return bridgeResult;
-				}
+				const result = normalizeEndpointResult(await win.__gpcPlacePixels(pixels));
+				if (!result) return { ok: false, status: 0, requestUncertain: true };
+				if (!result.needsSession) return result;
 			} catch (error) {
-				bridgeResult = {
-					ok: false,
-					status: 0,
-					text: error && error.message ? error.message : String(error),
-				};
+				return { ok: false, status: 0, requestUncertain: true, text: String(error) };
 			}
 		}
 
-		const auth = await getAuthPayloadAsync();
-		if (!auth.token || !Number.isFinite(auth.userId)) {
-			return {
-				ok: false,
-				status: 0,
-				text: bridgeResult && bridgeResult.text
-					? bridgeResult.text
-					: "Session GeoPixels introuvable. Reconnectez-vous.",
-			};
-		}
-		if (!auth.subject) {
-			return {
-				ok: false,
-				status: 0,
-				text: bridgeResult && bridgeResult.text
-					? bridgeResult.text
-					: "Session GeoPixels incomplète. Reconnectez-vous.",
-			};
+		const auth = await withTimeout(getAuthPayloadAsync(), PAINT_REQUEST_TIMEOUT_MS, "Délai de connexion à GeoPixels dépassé.");
+		if (state.stopRequested) return null;
+		if (!auth.token || !auth.subject || !Number.isFinite(auth.userId)) {
+			return { ok: false, status: 401, text: "Session GeoPixels incomplète. Reconnectez-vous." };
 		}
 
 		const pixelsWithUserId = pixels.map((pixel) => ({
@@ -1837,30 +1886,26 @@
 			Pixels: pixelsWithUserId,
 		};
 
-		const response = await fetch("/PlacePixels", {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify(payload),
-		});
-
-		if (!response.ok) {
-			const text = await response.text();
-			log("warn", "Échec de l’envoi des pixels", {
-				status: response.status,
-				text,
-				userIdType: typeof payload.UserId,
-				pixelCount: payload.Pixels.length,
-				firstPixel: payload.Pixels[0],
+		try {
+			const response = await fetch("/PlacePixels", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(payload),
+				signal: AbortSignal.timeout(PAINT_REQUEST_TIMEOUT_MS),
 			});
-			return { ok: false, status: response.status, text };
+			return {
+				ok: response.ok,
+				status: response.status,
+				retryAfter: response.headers.get("Retry-After"),
+				text: await response.text().catch(() => ""),
+			};
+		} catch (error) {
+			return { ok: false, status: 0, requestUncertain: true, text: String(error) };
 		}
-
-		for (const target of targets) boardColors.set(target.key, target.colorId);
-		state.placedThisRun += targets.length;
-		return { ok: true, status: response.status, text: await response.text().catch(() => "") };
 	}
 
 	function wait(ms) {
+		if (state.stopRequested) return Promise.resolve();
 		return new Promise((resolve) => {
 			const timer = setTimeout(() => {
 				stopWake = null;
@@ -1875,12 +1920,13 @@
 	}
 
 	function requestStop() {
+		if (!state.running) return;
 		state.stopRequested = true;
 		if (stopWake) stopWake();
 	}
 
 	async function startBot() {
-		if (state.running) return;
+		if (state.running || state.syncing) return;
 
 		prepareCompletionNotifications();
 		completionNotificationSent = false;
@@ -1888,12 +1934,17 @@
 		state.running = true;
 		state.stopRequested = false;
 		state.placedThisRun = 0;
-		state.localEnergy = null;
+		state.salvoPhase = "start";
+		state.nextBatchSize = 0;
+		const salvos = settings.energyMode === "salvos";
+		const limit = settings.maxBatchSize || MAX_PIXELS_PER_REQUEST;
+		let salvoRemaining = 0;
+		let refreshBoardBeforeSend = false;
 		setButtons();
 
 		try {
 			setStatus("running", "Préparation de l’image…");
-			buildTargets();
+			invalidateTargets();
 			await syncBoard();
 
 			while (!state.stopRequested) {
@@ -1908,38 +1959,110 @@
 					break;
 				}
 
-				const energy = await fetchCurrentEnergy();
-				if (energy <= 0) {
-					setStatus("waiting", "Énergie épuisée. Recharge en cours…");
-					await wait(readEnergyRateMs());
+				const reading = await fetchEnergySnapshot();
+				if (state.stopRequested) break;
+				state.nextBatchSize = 0;
+				if (reading.status === 401 || reading.status === 403) {
+					setStatus("error", "Lecture de l’énergie refusée. Vérifiez votre session GeoPixels.");
+					break;
+				}
+				if (!reading.energy) {
+					const limited = reading.status === 429;
+					const delayMs = limited ? rateLimitDelay(reading.retryAfter) : energyPollDelay(state.energy, 0);
+					if (delayMs > 2147483647) {
+						setStatus("error", "GeoPixels impose un délai de reprise trop long. Réessayez plus tard.");
+						break;
+					}
+					setStatus("waiting", limited
+						? "Limite de requêtes atteinte pour la lecture de l’énergie."
+						: "Énergie indisponible. Nouvelle lecture en attente…");
+					updateEnergyDisplay();
+					refreshBoardBeforeSend = true;
+					await wait(delayMs);
 					continue;
 				}
 
-				const amount = Math.min(energy, remainingTargets.length, MAX_PIXELS_PER_REQUEST);
+				const energy = reading.energy;
+				state.energy = energy;
+				const available = Math.max(0, energy.current - settings.energyReserve);
+				if (salvos && state.salvoPhase === "active" && (!available || !salvoRemaining)) {
+					state.salvoPhase = "resume";
+				}
+				const waitingForSalvo = salvos && state.salvoPhase !== "active";
+				const threshold = waitingForSalvo ? getEnergyThreshold(energy.capacity) : settings.energyReserve + 1;
+				if (threshold === null || energy.current < threshold) {
+					const exceedsCapacity = energy.capacity !== null && threshold > energy.capacity;
+					setStatus("waiting", threshold === null
+						? "Capacité maximale indisponible. Nouvelle lecture en attente…"
+						: exceedsCapacity
+							? "Seuil attendu supérieur à la capacité. Vérifiez le seuil et la réserve."
+							: "Recharge en cours…");
+					updateEnergyDisplay();
+					refreshBoardBeforeSend = true;
+					await wait(energyPollDelay(energy, threshold ?? 0));
+					continue;
+				}
+				if (refreshBoardBeforeSend) {
+					refreshBoardBeforeSend = false;
+					await syncBoard();
+					continue;
+				}
+				if (waitingForSalvo) {
+					state.salvoPhase = "active";
+					salvoRemaining = available;
+				}
+				const amount = Math.min(available, salvos ? salvoRemaining : available, remainingTargets.length, limit);
 				const batch = remainingTargets.slice(0, amount);
+				state.nextBatchSize = amount;
+				updateEnergyDisplay();
 				setStatus("running", "Envoi de " + amount + " pixel(s)…");
 
 				const result = await sendPixelBatch(batch);
+				if (!result) break;
+				state.nextBatchSize = 0;
 				if (!result.ok) {
-					const message = result.status === 0
-						? "Envoi des pixels impossible. Vérifiez votre connexion et votre session GeoPixels."
-						: "Échec de l’envoi des pixels (HTTP " + result.status + ").";
-					log("warn", message, result.text);
-					setStatus(result.status === 401 ? "error" : "waiting", message);
-					if (result.status === 401) break;
+					log("warn", "Échec de l’envoi des pixels", result.status, result.text);
 					if (result.status === 403 && /not enough energy/i.test(result.text || "")) {
-						state.localEnergy = 0;
+						state.energy = { ...energy, current: null };
+						if (salvos) state.salvoPhase = "resume";
+						salvoRemaining = 0;
 						setStatus("waiting", "Énergie insuffisante. Recharge en cours…");
-						await wait(readEnergyRateMs());
+						updateEnergyDisplay();
+						refreshBoardBeforeSend = true;
+						const resumeThreshold = salvos ? getEnergyThreshold(energy.capacity) : settings.energyReserve + 1;
+						await wait(energyPollDelay(energy, resumeThreshold ?? 0));
 						continue;
 					}
-					if (result.status === 403) break;
-					await wait(5000);
-					continue;
+					if (result.status === 429) {
+						const delayMs = rateLimitDelay(result.retryAfter);
+						if (delayMs <= 2147483647) {
+							setStatus("waiting", "Limite de requêtes atteinte. Reprise après le délai indiqué par GeoPixels.");
+							updateEnergyDisplay();
+							refreshBoardBeforeSend = true;
+							await wait(delayMs);
+							continue;
+						}
+					}
+					const uncertain = result.requestUncertain || result.status === 0 || result.status === 408 || result.status >= 500;
+					setStatus("error", uncertain
+						? "Résultat de l’envoi incertain. La peinture est arrêtée. Redémarrez pour resynchroniser la carte."
+						: result.status === 413
+							? "Groupe refusé par GeoPixels. Réduisez la taille maximale des groupes."
+							: "Échec de l’envoi des pixels (HTTP " + result.status + ").");
+					break;
 				}
 
-				markEnergySpent(batch.length, energy);
-				state.remaining = Math.max(0, state.remaining - batch.length);
+				for (const target of batch) boardColors.set(target.key, target.colorId);
+				state.placedThisRun += amount;
+				state.energy = { ...energy, current: energy.current - amount };
+				if (salvos) {
+					salvoRemaining -= amount;
+					if (!salvoRemaining || amount === available) state.salvoPhase = "resume";
+				}
+				if (!salvos || state.salvoPhase === "active") {
+					const usable = available - amount;
+					state.nextBatchSize = Math.min(usable, salvos ? salvoRemaining : usable, remainingTargets.length - amount, limit);
+				}
 				updateProgress();
 
 				if (state.remaining === 0) {
@@ -1949,10 +2072,11 @@
 				}
 
 				await wait(REQUEST_PAUSE_MS);
+				if (state.stopRequested) break;
 				await syncBoard();
 			}
 
-			if (state.stopRequested) setStatus("stopped", "Arrêté");
+			if (state.stopRequested && state.status !== "error") setStatus("stopped", "Arrêté");
 		} catch (error) {
 			log("error", error);
 			setStatus("error", error instanceof TypeError
@@ -1961,15 +2085,22 @@
 		} finally {
 			state.running = false;
 			state.stopRequested = false;
+			state.salvoPhase = "start";
+			state.nextBatchSize = 0;
 			setButtons();
+			updateEnergyDisplay();
 		}
 	}
 
 	async function manualSync() {
+		if (state.running || state.syncing) return;
+		state.syncing = true;
+		setButtons();
 		try {
 			invalidateTargets();
-			buildTargets();
 			await syncBoard();
+			const reading = await fetchEnergySnapshot();
+			if (reading.energy) state.energy = reading.energy;
 			const remainingTargets = getRemainingTargets();
 			state.remaining = remainingTargets.length;
 			setStatus("idle", "Synchronisation terminée");
@@ -1979,6 +2110,9 @@
 			setStatus("error", error instanceof TypeError
 				? "Impossible de synchroniser l’image. Vérifiez votre connexion à GeoPixels."
 				: error?.message || "Impossible de synchroniser l’image.");
+		} finally {
+			state.syncing = false;
+			setButtons();
 		}
 	}
 
@@ -1995,11 +2129,57 @@
 
 	function setButtons() {
 		if (!ui.start || !ui.stop || !ui.sync) return;
-		ui.start.disabled = state.running;
+		ui.start.disabled = state.running || state.syncing;
 		ui.stop.disabled = !state.running;
-		ui.sync.disabled = state.running;
+		ui.sync.disabled = state.running || state.syncing;
 		if (ui.buyColors) ui.buyColors.disabled = state.running;
 		if (ui.buyCapacity) ui.buyCapacity.disabled = state.running;
+		if (ui.energyControls) ui.energyControls.disabled = state.running;
+	}
+
+	function updateEnergyDisplay() {
+		if (!ui.energyText) return;
+		const { current, capacity } = readEnergy();
+		const salvos = settings.energyMode === "salvos";
+		const threshold = salvos && state.salvoPhase !== "active" ? getEnergyThreshold(capacity) : null;
+		ui.energyText.textContent = (current ?? "—") + " / " + (capacity ?? "—");
+		ui.salvoState.textContent = salvos ? SALVO_LABELS[state.salvoPhase] : "Mode continu";
+		ui.energyThreshold.textContent = threshold ?? "—";
+		ui.nextBatchSize.textContent = state.running ? state.nextBatchSize : "—";
+	}
+
+	function bindEnergySettings() {
+		const controls = {
+			energyMode: ui.energyControls.querySelector("#gpc-energy-mode"),
+			startEnergyUnit: ui.energyControls.querySelector("#gpc-energy-start-unit"),
+			startEnergyThreshold: ui.energyControls.querySelector("#gpc-energy-start-value"),
+			resumeEnergyUnit: ui.energyControls.querySelector("#gpc-energy-resume-unit"),
+			resumeEnergyThreshold: ui.energyControls.querySelector("#gpc-energy-resume-value"),
+			energyReserve: ui.energyControls.querySelector("#gpc-energy-reserve"),
+			maxBatchSize: ui.energyControls.querySelector("#gpc-energy-group-limit"),
+		};
+		const syncControls = () => {
+			for (const [name, control] of Object.entries(controls)) control.value = settings[name];
+			const continuous = settings.energyMode === "continuous";
+			for (const phase of ["start", "resume"]) {
+				const unit = controls[phase + "EnergyUnit"];
+				const threshold = controls[phase + "EnergyThreshold"];
+				unit.disabled = continuous;
+				threshold.disabled = continuous;
+				threshold.max = unit.value === "percent" ? "100" : "";
+			}
+		};
+		for (const [name, control] of Object.entries(controls)) {
+			control.addEventListener("change", () => {
+				if (state.running) return;
+				Object.assign(settings, normalizeEnergySettings({ ...settings, [name]: control.value }));
+				saveSettings();
+				syncControls();
+				updateEnergyDisplay();
+				if (ui.etaText) ui.etaText.textContent = state.remaining ? estimateEta(state.remaining) : "—";
+			});
+		}
+		syncControls();
 	}
 
 	function updateProgress() {
@@ -2012,7 +2192,7 @@
 		if (ui.bar) ui.bar.style.width = percent + "%";
 		if (ui.countText) ui.countText.textContent = done + " / " + total;
 		if (ui.remainingText) ui.remainingText.textContent = String(remaining);
-		if (ui.energyText) ui.energyText.textContent = String(readEnergy());
+		updateEnergyDisplay();
 		if (ui.etaText) ui.etaText.textContent = remaining ? estimateEta(remaining) : "-";
 	}
 
@@ -2253,6 +2433,10 @@
 				padding-top: 10px;
 				border-top: 1px solid #273449;
 			}
+			#gpc-energy-controls { min-width: 0; padding: 0; margin: 7px 0 0; border: 0; }
+			.gpc-energy-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+			.gpc-energy-grid label { min-width: 0; display: grid; gap: 3px; }
+			.gpc-energy-summary { display: flex; flex-wrap: wrap; gap: 2px 9px; margin-bottom: 6px; }
 			.gpc-check {
 				display: flex;
 				align-items: center;
@@ -2362,9 +2546,49 @@
 				<div class="gpc-stats">
 					<div class="gpc-stat"><b>Peints</b><span id="gpc-count">0 / 0</span></div>
 					<div class="gpc-stat"><b>Restants</b><span id="gpc-left">0</span></div>
-					<div class="gpc-stat"><b>Énergie</b><span id="gpc-energy">0</span></div>
+					<div class="gpc-stat"><b>Énergie</b><span id="gpc-energy">— / —</span></div>
 					<div class="gpc-stat"><b>Temps estimé</b><span id="gpc-eta">-</span></div>
 				</div>
+				<div class="gpc-energy-summary gpc-muted">
+					<strong id="gpc-salvo-state"></strong>
+					<span>Seuil attendu <b id="gpc-energy-threshold"></b></span>
+					<span>Prochain groupe <b id="gpc-next-batch"></b></span>
+				</div>
+				<details class="gpc-section">
+					<summary>Réglages de l’énergie</summary>
+					<fieldset id="gpc-energy-controls" class="gpc-energy-grid" aria-label="Réglages de l’énergie">
+						<label style="grid-column: 1 / -1;">Mode
+							<select id="gpc-energy-mode" class="gpc-input">
+								<option value="salvos">Salves</option>
+								<option value="continuous">Continu</option>
+							</select>
+						</label>
+						<label>Seuil de démarrage
+							<input id="gpc-energy-start-value" class="gpc-input" type="number" min="1" step="1">
+						</label>
+						<label>Unité du démarrage
+							<select id="gpc-energy-start-unit" class="gpc-input">
+								<option value="percent">% de la capacité</option>
+								<option value="absolute">Énergie absolue</option>
+							</select>
+						</label>
+						<label>Seuil de reprise
+							<input id="gpc-energy-resume-value" class="gpc-input" type="number" min="1" step="1">
+						</label>
+						<label>Unité de la reprise
+							<select id="gpc-energy-resume-unit" class="gpc-input">
+								<option value="percent">% de la capacité</option>
+								<option value="absolute">Énergie absolue</option>
+							</select>
+						</label>
+						<label>Réserve minimale
+							<input id="gpc-energy-reserve" class="gpc-input" type="number" min="0" step="1">
+						</label>
+						<label>Groupe max. (0 = auto)
+							<input id="gpc-energy-group-limit" class="gpc-input" type="number" min="0" max="${MAX_PIXELS_PER_REQUEST}" step="1">
+						</label>
+					</fieldset>
+				</details>
 				<div class="gpc-row">
 					<label class="gpc-check"><input id="gpc-free" type="checkbox"> Couleurs gratuites</label>
 					<label class="gpc-check"><input id="gpc-alpha" type="checkbox"> Couleurs transparentes</label>
@@ -2447,6 +2671,10 @@
 		ui.countText = panel.querySelector("#gpc-count");
 		ui.remainingText = panel.querySelector("#gpc-left");
 		ui.energyText = panel.querySelector("#gpc-energy");
+		ui.energyControls = panel.querySelector("#gpc-energy-controls");
+		ui.salvoState = panel.querySelector("#gpc-salvo-state");
+		ui.energyThreshold = panel.querySelector("#gpc-energy-threshold");
+		ui.nextBatchSize = panel.querySelector("#gpc-next-batch");
 		ui.etaText = panel.querySelector("#gpc-eta");
 		ui.free = panel.querySelector("#gpc-free");
 		ui.alpha = panel.querySelector("#gpc-alpha");
@@ -2476,6 +2704,7 @@
 		ui.alpha.checked = !!settings.includeTransparent;
 		ui.smartPriority.checked = !!settings.smartPriority;
 		ui.wrongColorPriority.checked = !!settings.prioritizeIncorrectColors;
+		bindEnergySettings();
 		panel.classList.toggle("gpc-min", !!settings.minimized);
 		ui.min.textContent = settings.minimized ? "+" : "-";
 		ui.min.title = settings.minimized ? "Développer" : "Réduire";
