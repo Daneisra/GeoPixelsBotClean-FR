@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GhostPixel Bot Clean
 // @namespace    https://github.com/Fox3225/GeoPixelsBotClean
-// @version      1.1.11
+// @version      1.1.12
 // @description  Script GeoPixels pour peindre des images fantômes, synchroniser la progression, recevoir une notification de fin, gérer les priorités de couleurs, acheter les couleurs manquantes et augmenter la capacité d’énergie.
 // @author       Fox3225 + Codex
 // @match        https://geopixels.net/*
@@ -22,7 +22,7 @@
 	"use strict";
 
 	const win = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
-	const VERSION = "1.1.11";
+	const VERSION = "1.1.12";
 	const ACCOUNT_MONITOR_URL = "http://127.0.0.1:47631/connect";
 	const TILE_SIZE = 1000;
 	const TILE_BATCH_SIZE = 9;
@@ -36,6 +36,15 @@
 	const MAX_COLOR_PURCHASES_PER_RUN = 5;
 	const ENERGY_CAPACITY_PURCHASE_CHUNK = 50;
 	const SETTINGS_KEY = "ghostpixel_clean_settings";
+	const AUTO_UPGRADES = {
+		FasterRecharge: { label: "Vitesse de recharge", input: "FasterRechargeInput", tariff: /^(\d+) Pixels\s*\/\s*-1\s*s\s*\(cap at (\d+)\s*s\)$/i },
+		EnergyCapacity: { label: "Capacité énergétique", input: "EnergyCapacityInput", tariff: /^(\d+) Pixels\s*\/\s*\+5 max$/i },
+		Energy: { label: "Recharge d’énergie", input: "EnergyInput", tariff: /^(\d+) Pixels\s*\/\s*\+20 energy$/i },
+		ExtraColor: { label: "Couleurs manquantes", input: "ExtraColorInput", tariff: /^(\d+) Pixels\s*\/\s*Any hex color allowed$/i },
+	};
+	const AUTO_UPGRADE_ORDER = Object.keys(AUTO_UPGRADES);
+	// Le profil GeoPixels inclut la transparence dans son compteur de 35 couleurs.
+	const FREE_COLOR_PALETTE_LIMIT = 35;
 	const DEFAULT_ENERGY_SETTINGS = {
 		energyMode: "salvos",
 		startEnergyUnit: "percent",
@@ -90,6 +99,8 @@
 	let authCache = null;
 	let completionNotificationSent = false;
 	let hadPendingTargets = false;
+	let purchaseInFlight = false;
+	const autoPurchases = { balance: null, spent: 0, next: "", message: "", retryAt: 0 };
 	const purchaseEvents = [];
 	const purchasedColorIds = new Set();
 	const boardColors = new Map();
@@ -415,16 +426,20 @@
 					});
 					Object.defineProperty(window, "__gpcMakePurchase", {
 						configurable: true,
-						value: async (type, amount) => {
+						value: async (type, amount, expectedUserId) => {
 							const auth = authPayload();
 							if (auth.error) {
-								return { ok: false, status: 0, text: auth.error, debug: auth.debug, type, amount };
+								return { ok: false, status: 0, needsSession: true, text: auth.error, debug: auth.debug, type, amount };
+							}
+							if (expectedUserId != null && auth.UserId !== expectedUserId) {
+								return { ok: false, status: 401, text: "Le compte GeoPixels a changé." };
 							}
 							try {
 								return await readResponse(await fetch("/MakePurchase", {
 									method: "POST",
 									headers: { "Content-Type": "application/json" },
-									body: JSON.stringify({ ...auth, type, amount })
+									body: JSON.stringify({ ...auth, type, amount }),
+									signal: AbortSignal.timeout(${PURCHASE_RESULT_TIMEOUT_MS})
 								}));
 							} catch (error) {
 								return {
@@ -589,6 +604,7 @@
 	function loadSettings() {
 		const fallback = {
 			...DEFAULT_ENERGY_SETTINGS,
+			automaticPurchases: normalizeAutomaticPurchases(),
 			includeFreeColors: true,
 			includeTransparent: false,
 			ignoredColors: [],
@@ -603,6 +619,7 @@
 		try {
 			const loaded = { ...fallback, ...JSON.parse(storageGet(SETTINGS_KEY) || "{}") };
 			Object.assign(loaded, normalizeEnergySettings(loaded));
+			loaded.automaticPurchases = normalizeAutomaticPurchases(loaded.automaticPurchases);
 			loaded.ignoredColors = Array.isArray(loaded.ignoredColors)
 				? loaded.ignoredColors.map(toColorId).filter((id) => id !== null)
 				: [];
@@ -639,6 +656,21 @@
 
 	function saveSettings() {
 		storageSet(SETTINGS_KEY, JSON.stringify(settings));
+	}
+
+	function normalizeAutomaticPurchases(values) {
+		const config = values || {};
+		const order = [...new Set(Array.isArray(config.order) ? config.order : [])]
+			.filter((type) => Object.hasOwn(AUTO_UPGRADES, type));
+		const nonnegative = (value) => Number.isSafeInteger(Number(value)) ? Math.max(0, Number(value)) : 0;
+		return {
+			policy: ["limited", "unlimited"].includes(config.policy) ? config.policy : "off",
+			reserve: nonnegative(config.reserve),
+			limit: nonnegative(config.limit),
+			order: [...new Set([...order, ...AUTO_UPGRADE_ORDER])],
+			enabled: AUTO_UPGRADE_ORDER.filter((type) => Array.isArray(config.enabled) && config.enabled.includes(type)),
+			accountId: Number.isSafeInteger(config.accountId) && config.accountId > 0 ? config.accountId : null,
+		};
 	}
 
 	function readGlobal(name) {
@@ -774,6 +806,10 @@
 
 	function getOwnedColorIds() {
 		const colors = readGlobal("Colors");
+		const verifiedPalette = autoPurchases.palette;
+		if (verifiedPalette && verifiedPalette.accountId === getAuthPayload().userId) {
+			return new Set([...verifiedPalette.colors, ...purchasedColorIds]);
+		}
 		if (!Array.isArray(colors)) {
 			return purchasedColorIds.size ? new Set(purchasedColorIds) : null;
 		}
@@ -946,6 +982,7 @@
 			return {
 				status: result.status,
 				retryAfter: result.retryAfter,
+				data: result.ok ? result.data : null,
 				energy: result.ok ? energyFromUserData(result.data, result.serverDate) : null,
 			};
 		} catch (error) {
@@ -1166,21 +1203,20 @@
 		};
 	}
 
-	async function callPurchaseEndpoint(type, amount) {
+	async function callPurchaseEndpoint(type, amount, { accountId, signal }) {
 		const normalizedAmount = type === "ExtraColor" ? toColorId(amount) : amount;
-		let bridgeResult = null;
 		installPageBridge();
+		if (signal.aborted || (accountId != null && state.stopRequested)) return { ok: false, notSent: true };
 		if (typeof win.__gpcMakePurchase === "function") {
 			try {
-				bridgeResult = normalizeEndpointResult(
-					await win.__gpcMakePurchase(type, normalizedAmount),
+				const result = normalizeEndpointResult(
+					await win.__gpcMakePurchase(type, normalizedAmount, accountId),
 					{ type, amount: normalizedAmount }
 				);
-				if (bridgeResult && (bridgeResult.ok || bridgeResult.status !== 0 || bridgeResult.requestUncertain)) {
-					return bridgeResult;
-				}
+				if (!result) return { ok: false, status: 0, requestUncertain: true };
+				if (!result.needsSession) return result;
 			} catch (error) {
-				bridgeResult = {
+				return {
 					ok: false,
 					status: 0,
 					text: error && error.message ? error.message : String(error),
@@ -1192,13 +1228,15 @@
 		}
 
 		const auth = await getAuthPayloadAsync();
+		if (signal.aborted || (accountId != null && (state.stopRequested || auth.userId !== accountId))) {
+			return { ok: false, notSent: true };
+		}
 		if (!auth.token || !auth.subject || !Number.isFinite(auth.userId)) {
 			return {
 				ok: false,
 				status: 0,
-				text: bridgeResult && bridgeResult.text
-					? bridgeResult.text
-					: "Session GeoPixels incomplète. Reconnectez-vous avant d’effectuer un achat.",
+				notSent: true,
+				text: "Session GeoPixels incomplète. Reconnectez-vous avant d’effectuer un achat.",
 				type,
 				amount: normalizedAmount,
 			};
@@ -1216,11 +1254,13 @@
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(payload),
+			signal,
 		});
 
 		return {
 			ok: response.ok,
 			status: response.status,
+			retryAfter: response.headers.get("Retry-After"),
 			text: await response.text(),
 			type,
 			amount,
@@ -1249,11 +1289,22 @@
 		};
 	}
 
-	async function callPagePurchase(type, amount) {
+	async function callPagePurchase(type, amount, accountId = null) {
+		if (purchaseInFlight) return { ok: false, notSent: true };
+		purchaseInFlight = true;
+		try {
+			return await dispatchPurchase(type, amount, accountId);
+		} finally {
+			purchaseInFlight = false;
+		}
+	}
+
+	async function dispatchPurchase(type, amount, accountId) {
 		let direct;
 		try {
+			const signal = AbortSignal.timeout(PURCHASE_RESULT_TIMEOUT_MS);
 			direct = await withTimeout(
-				callPurchaseEndpoint(type, amount),
+				callPurchaseEndpoint(type, amount, { accountId, signal }),
 				PURCHASE_RESULT_TIMEOUT_MS,
 				"Délai d’attente dépassé. Vérifiez le résultat de l’achat avant de réessayer."
 			);
@@ -1261,12 +1312,13 @@
 			return {
 				ok: false,
 				status: 0,
+				requestUncertain: true,
 				text: error && error.message ? error.message : "Délai d’attente dépassé pour l’achat.",
 				type,
 				amount,
 			};
 		}
-		if (direct && (direct.ok || direct.status !== 0 || direct.requestUncertain)) return direct;
+		if (accountId !== null || !direct.notSent) return direct;
 
 		installPurchaseObserver();
 		try {
@@ -1281,7 +1333,7 @@
 			const observed = await waitForPurchaseResult(type, amount, startedAt);
 			if (observed && observed.status !== 0) return observed;
 		} catch {}
-		return direct || callPurchaseEndpoint(type, amount);
+		return { ok: false, status: 0, requestUncertain: true };
 	}
 
 	function getGhostSource() {
@@ -1340,11 +1392,13 @@
 			skipOrdering ? "source-order" : "priority-order",
 		].join(":");
 
-		if (targetCache && targetCache.sourceKey === sourceKey) return targetCache;
+		if (!options.silent && targetCache && targetCache.sourceKey === sourceKey && targetCache.imageData === source.imageData) {
+			return targetCache;
+		}
 
 		const ignored = new Set(settings.ignoredColors);
 		const priority = new Set(settings.priorityColors);
-		const owned = getOwnedColorIds();
+		const owned = options.owned || getOwnedColorIds();
 		const targets = [];
 		const targetKeys = new Set();
 		const targetsByTile = new Map();
@@ -1376,15 +1430,19 @@
 			targetsByTile.get(tk).push(target);
 		}
 
-		targetCache = {
+		const cache = {
 			sourceKey,
+			imageData: source.imageData,
 			targets: skipOrdering ? targets : orderTargets(targets),
 			targetKeys,
 			targetsByTile,
 			tileKeys: [...targetsByTile.keys()],
 		};
-		if (!options.silent) state.totalTargets = targetCache.targets.length;
-		return targetCache;
+		if (!options.silent) {
+			targetCache = cache;
+			state.totalTargets = cache.targets.length;
+		}
+		return cache;
 	}
 
 	function orderTargets(targets) {
@@ -1451,8 +1509,7 @@
 		}
 	}
 
-	async function getMissingRequiredColors() {
-		const owned = getOwnedColorIds();
+	async function getMissingRequiredColors(owned = getOwnedColorIds()) {
 		if (!owned) throw new Error("GeoPixels charge encore la liste des couleurs achetées.");
 
 		// Seuls les pixels aux couleurs payantes non acquises comptent pour l’achat.
@@ -1462,32 +1519,257 @@
 			onlyUnowned: true,
 			skipOrdering: true,
 			silent: true,
+			owned,
+			colors: new Map(),
+			timestamps: new Map(),
 		};
-		invalidateTargets({ preserveProgress: true });
-		try {
-			await syncBoard(purchaseOptions);
-			const cache = buildTargets(purchaseOptions);
-			let unsyncedCount = 0;
-			const pendingColors = new Set();
-			for (const target of cache.targets) {
-				if (!boardColors.has(target.key)) {
-					unsyncedCount++;
-					continue;
-				}
-				if (boardColors.get(target.key) !== target.colorId) {
-					pendingColors.add(target.colorId);
-				}
+		const cache = buildTargets(purchaseOptions);
+		await syncBoard(purchaseOptions, cache);
+		let unsyncedCount = 0;
+		const pendingColors = new Set();
+		for (const target of cache.targets) {
+			if (!purchaseOptions.colors.has(target.key)) {
+				unsyncedCount++;
+				continue;
 			}
-			if (unsyncedCount) {
-				throw new Error(
-					"Impossible de vérifier " + unsyncedCount +
-					" pixel(s) sur la carte. Relancez la synchronisation avant de réessayer l’achat."
-				);
-			}
+			if (purchaseOptions.colors.get(target.key) !== target.colorId) pendingColors.add(target.colorId);
+		}
+		if (state.stopRequested) return [];
+		if (unsyncedCount) {
+			throw new Error("Impossible de vérifier " + unsyncedCount + " pixel(s) sur la carte.");
+		}
+		return [...pendingColors].sort((a, b) => a - b);
+	}
 
-			return [...pendingColors].sort((a, b) => a - b);
-		} finally {
-			invalidateTargets({ preserveProgress: true });
+	function automaticPurchaseLedgerKey(accountId) {
+		return SETTINGS_KEY + "_purchases_" + accountId;
+	}
+
+	function sameAutomaticPurchaseSettings(config) {
+		return JSON.stringify(loadSettings().automaticPurchases) === JSON.stringify(config);
+	}
+
+	function readAutomaticPurchaseLedger(accountId) {
+		const raw = storageGet(automaticPurchaseLedgerKey(accountId));
+		const ledger = JSON.parse(raw ?? '{"spent":0,"pending":null}');
+		if (!Number.isSafeInteger(ledger?.spent) || ledger.spent < 0) throw new Error("Historique des achats illisible.");
+		return ledger;
+	}
+
+	function writeAutomaticPurchaseLedger(accountId, ledger) {
+		const key = automaticPurchaseLedgerKey(accountId);
+		const value = JSON.stringify(ledger);
+		storageSet(key, value);
+		if (storageGet(key) !== value) throw new Error("Impossible d’enregistrer l’achat dans le navigateur.");
+	}
+
+	function automaticBalance(data) {
+		if (data?.pixels == null || data.pixels === "") return null;
+		const balance = Number(data.pixels);
+		return Number.isSafeInteger(balance) && balance >= 0 ? balance : null;
+	}
+
+	function accountPalette(data) {
+		const colors = data?.colors;
+		if (!Array.isArray(colors) || !colors.every((value) => Number.isInteger(value) && value >= -1 && value <= 0xFFFFFF)) {
+			return null;
+		}
+		return new Set(colors);
+	}
+
+	function readUpgradeTariff(type, colorCount) {
+		const upgrade = AUTO_UPGRADES[type];
+		const card = document.getElementById(upgrade.input)?.parentElement?.parentElement;
+		const matches = Array.from(card?.children || [], (child) => child.textContent?.trim().match(upgrade.tariff)).filter(Boolean);
+		if (matches.length !== 1 || !Number.isSafeInteger(Number(matches[0][1]) * 5)) return null;
+		const [, cost, minimum] = matches[0];
+		const free = type === "ExtraColor" && Number.isInteger(colorCount) &&
+			document.getElementById("freeColorNotice") && colorCount + 1 < FREE_COLOR_PALETTE_LIMIT;
+		return { cost: free ? 0 : Number(cost), minimum: Number(minimum) };
+	}
+
+	function updateAutomaticPurchases(message, next = "") {
+		autoPurchases.message = message;
+		autoPurchases.next = next;
+		renderAutomaticPurchases();
+	}
+
+	function confirmAutomaticPurchase(pending, reading) {
+		if (pending.accepted !== true) return false;
+		if (automaticBalance(reading.data) !== pending.balance - pending.cost * 5) return false;
+		const energy = reading.energy;
+		switch (pending.type) {
+			case "FasterRecharge": return energy?.rate === pending.before - 1;
+			case "EnergyCapacity": return energy?.capacity === pending.before + 5;
+			case "Energy": return energy != null && energy.current >= pending.before + 20;
+			case "ExtraColor": return accountPalette(reading.data)?.has(pending.amount) === true;
+			default: return false;
+		}
+	}
+
+	function recordAutomaticPurchase(accountId, ledger, reading) {
+		const pending = ledger.pending;
+		const spent = ledger.spent + pending.cost;
+		writeAutomaticPurchaseLedger(accountId, { spent, pending: null });
+		autoPurchases.spent = spent;
+		if (pending.type === "ExtraColor") {
+			autoPurchases.palette = { accountId, colors: accountPalette(reading.data) };
+			return true;
+		}
+		return false;
+	}
+
+	async function checkAutomaticPurchases(hasPendingPixels, accountId, config) {
+		const reading = await fetchEnergySnapshot();
+		const outcome = { reading, purchased: false, colorsChanged: false, colorsOutstanding: false };
+		const balance = automaticBalance(reading.data);
+		autoPurchases.balance = balance === null ? null : Math.floor(balance / 5);
+		if (state.stopRequested || getAuthPayload().userId !== accountId) return outcome;
+		if (!sameAutomaticPurchaseSettings(config)) {
+			updateAutomaticPurchases("Réglages modifiés dans un autre onglet. Rechargez la page.");
+			return outcome;
+		}
+		const ledger = readAutomaticPurchaseLedger(accountId);
+		autoPurchases.spent = ledger.spent;
+		if (ledger.pending) {
+			if (confirmAutomaticPurchase(ledger.pending, reading)) {
+				outcome.colorsChanged = recordAutomaticPurchase(accountId, ledger, reading);
+				updateAutomaticPurchases("Achat précédent confirmé par le compte.");
+			} else {
+				updateAutomaticPurchases("Achat précédent non confirmé. Achats automatiques suspendus.");
+				outcome.colorsOutstanding = ledger.pending.type === "ExtraColor";
+			}
+			return outcome;
+		}
+		if (balance === null || !reading.energy) {
+			updateAutomaticPurchases("Données du compte indisponibles.");
+			return outcome;
+		}
+		if (Date.now() < Math.max(autoPurchases.retryAt, ledger.retryAt || 0)) {
+			renderAutomaticPurchases();
+			return outcome;
+		}
+
+		const energy = reading.energy;
+		const palette = accountPalette(reading.data);
+		let purchase;
+		let colorSource;
+		let colorSignature;
+		for (const type of config.order) {
+			if (!config.enabled.includes(type) || (!hasPendingPixels && type !== "ExtraColor")) continue;
+			const quote = readUpgradeTariff(type, reading.data?.colors?.length);
+			if (!quote || (type === "ExtraColor" && !palette)) {
+				updateAutomaticPurchases("Tarif ou disponibilité non vérifiable.", AUTO_UPGRADES[type].label);
+				return outcome;
+			}
+			let amount = 1;
+			let before = null;
+			if (type === "FasterRecharge") {
+				if (!Number.isInteger(energy.rate) || energy.rate <= 0) continue;
+				if (energy.rate - 1 < quote.minimum) continue;
+				before = energy.rate;
+			} else if (type === "EnergyCapacity") {
+				if (energy.capacity === null) continue;
+				before = energy.capacity;
+			} else if (type === "Energy") {
+				before = energy.current;
+			} else {
+				colorSource = getGhostSource();
+				colorSignature = settingsSignature();
+				try {
+					[amount] = await getMissingRequiredColors(palette);
+				} catch (error) {
+					autoPurchases.retryAt = Date.now() + EMPTY_ENERGY_PAUSE_MIN_MS;
+					updateAutomaticPurchases(error.message, AUTO_UPGRADES[type].label);
+					return outcome;
+				}
+				if (amount === undefined) continue;
+				outcome.colorsOutstanding = true;
+			}
+			purchase = { type, amount, before, balance, cost: quote.cost };
+			break;
+		}
+
+		if (!purchase) {
+			updateAutomaticPurchases("Aucune amélioration disponible ou nécessaire.");
+			return outcome;
+		}
+		const label = purchase.type === "ExtraColor" ? "Couleur " + colorHex(purchase.amount) : AUTO_UPGRADES[purchase.type].label;
+		const next = label + " · " + purchase.cost + " Pixels";
+		if (purchase.cost > Math.max(0, autoPurchases.balance - config.reserve)) {
+			updateAutomaticPurchases("Solde insuffisant après déduction de la réserve.", next);
+			return outcome;
+		}
+		if (config.policy === "limited" && purchase.cost > Math.max(0, config.limit - ledger.spent)) {
+			updateAutomaticPurchases("Plafond cumulé des achats automatiques atteint.", next);
+			return outcome;
+		}
+		if (purchase.type === "ExtraColor") {
+			outcome.reading = await fetchEnergySnapshot();
+			const refreshedPalette = accountPalette(outcome.reading.data);
+			const refreshedTariff = readUpgradeTariff(purchase.type, outcome.reading.data?.colors?.length);
+			if (automaticBalance(outcome.reading.data) !== balance || !refreshedPalette ||
+				refreshedPalette.has(purchase.amount) || refreshedTariff?.cost !== purchase.cost) {
+				updateAutomaticPurchases("Le solde ou la palette a changé. Nouvelle vérification requise.", next);
+				return outcome;
+			}
+			const current = getGhostSource();
+			if (current?.imageData !== colorSource?.imageData || current?.gridX !== colorSource?.gridX ||
+				current?.gridY !== colorSource?.gridY || settingsSignature() !== colorSignature) return outcome;
+		}
+		if (state.stopRequested || getAuthPayload().userId !== accountId || !sameAutomaticPurchaseSettings(config)) return outcome;
+		writeAutomaticPurchaseLedger(accountId, { ...ledger, pending: purchase });
+		updateAutomaticPurchases("Achat en cours de vérification…", next);
+		const result = await callPagePurchase(purchase.type, purchase.amount, accountId);
+		if (result.notSent || [401, 402, 429].includes(result.status)) {
+			const delayMs = result.status === 429 ? rateLimitDelay(result.retryAfter) : EMPTY_ENERGY_PAUSE_MIN_MS;
+			autoPurchases.retryAt = Math.min(Number.MAX_SAFE_INTEGER, Date.now() + delayMs);
+			writeAutomaticPurchaseLedger(accountId, result.status === 429 ? { ...ledger, retryAt: autoPurchases.retryAt } : ledger);
+			updateAutomaticPurchases(result.status ? "Achat refusé par GeoPixels (HTTP " + result.status + ")." : "Achat interrompu avant l’envoi.", next);
+			return outcome;
+		}
+
+		if (result.status === 200) {
+			purchase.accepted = true;
+			writeAutomaticPurchaseLedger(accountId, { ...ledger, pending: purchase });
+		}
+		outcome.reading = await fetchEnergySnapshot();
+		const afterBalance = automaticBalance(outcome.reading.data);
+		autoPurchases.balance = afterBalance === null ? null : Math.floor(afterBalance / 5);
+		if (getAuthPayload().userId !== accountId || !confirmAutomaticPurchase(purchase, outcome.reading)) {
+			const detail = result.status && result.status !== 200 ? " (HTTP " + result.status + ")" : "";
+			updateAutomaticPurchases("Résultat non confirmé" + detail + ". Achats suspendus jusqu’à vérification du compte.", next);
+			return outcome;
+		}
+		outcome.colorsChanged = recordAutomaticPurchase(accountId, { ...ledger, pending: purchase }, outcome.reading);
+		outcome.purchased = true;
+		updateAutomaticPurchases(label + " confirmé.");
+		return outcome;
+	}
+
+	async function runAutomaticPurchases(hasPendingPixels) {
+		const config = settings.automaticPurchases;
+		if (config.policy === "off" || !config.enabled.length) return null;
+		const accountId = getAuthPayload().userId;
+		if (config.accountId === null || config.accountId !== accountId) {
+			updateAutomaticPurchases("Autorisation requise pour ce compte.");
+			return null;
+		}
+		const locks = window.navigator?.locks;
+		if (!locks) {
+			updateAutomaticPurchases("Verrou inter-onglets indisponible dans le navigateur.");
+			return null;
+		}
+		try {
+			return await locks.request(automaticPurchaseLedgerKey(accountId), { ifAvailable: true }, async (lock) => {
+				if (lock) return checkAutomaticPurchases(hasPendingPixels, accountId, config);
+				updateAutomaticPurchases("Achats automatiques en cours dans un autre onglet.");
+				return null;
+			});
+		} catch (error) {
+			log("warn", "Achats automatiques bloqués.", error);
+			updateAutomaticPurchases("Vérification des achats indisponible. Consultez le journal du navigateur.");
+			return null;
 		}
 	}
 
@@ -1703,7 +1985,7 @@
 		return ctx.getImageData(0, 0, TILE_SIZE, TILE_SIZE);
 	}
 
-	function readFullTilePixels(tileX, tileY, imageData, targets) {
+	function readFullTilePixels(tileX, tileY, imageData, targets, colors) {
 		const data = imageData.data;
 		const topY = tileY + TILE_SIZE - 1;
 
@@ -1713,14 +1995,14 @@
 			if (col < 0 || col >= TILE_SIZE || row < 0 || row >= TILE_SIZE) continue;
 
 			const index = ((row * TILE_SIZE) + col) * 4;
-			boardColors.set(
+			colors.set(
 				target.key,
 				rgbaToColorId(data[index], data[index + 1], data[index + 2], data[index + 3])
 			);
 		}
 	}
 
-	async function fetchTiles(tileCoords) {
+	async function fetchTiles(tileCoords, timestamps) {
 		const response = await fetch("/GetPixelsCached", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
@@ -1729,7 +2011,7 @@
 				Tiles: tileCoords.map((tile) => ({
 					x: tile.x,
 					y: tile.y,
-					timestamp: tileTimestamps.get(tileKey(tile.x, tile.y)) || 0,
+					timestamp: timestamps.get(tileKey(tile.x, tile.y)) || 0,
 				})),
 			}),
 		});
@@ -1740,22 +2022,22 @@
 		return response.json();
 	}
 
-	async function syncBoard(options = {}) {
-		const cache = buildTargets(options);
+	async function syncBoard(options = {}, cache = buildTargets(options)) {
 		if (!cache.tileKeys.length) return;
 
-		setStatus("syncing", "Synchronisation de " + cache.tileKeys.length + " tuile(s)…");
+		const { colors = boardColors, timestamps = tileTimestamps } = options;
+		if (!options.silent) setStatus("syncing", "Synchronisation de " + cache.tileKeys.length + " tuile(s)…");
 		for (const group of chunk(cache.tileKeys.map(parseTileKey), TILE_BATCH_SIZE)) {
 			if (state.stopRequested) return;
 
-			const payload = await fetchTiles(group);
-			if (payload && payload.ServerTimestamp) state.serverTimestamp = payload.ServerTimestamp;
+			const payload = await fetchTiles(group, timestamps);
+			if (!options.silent && payload?.ServerTimestamp) state.serverTimestamp = payload.ServerTimestamp;
 			const timestamp = payload && Number(payload.ServerTimestamp);
 
 			for (const [responseKey, tile] of Object.entries((payload && payload.Tiles) || {})) {
 				const { x: tileX, y: tileY } = parseTileKey(responseKey);
 				if (!Number.isFinite(tileX) || !Number.isFinite(tileY)) continue;
-				if (Number.isFinite(timestamp)) tileTimestamps.set(tileKey(tileX, tileY), timestamp);
+				if (Number.isFinite(timestamp)) timestamps.set(tileKey(tileX, tileY), timestamp);
 				const targetGroup = cache.targetsByTile.get(tileKey(tileX, tileY));
 				if (!targetGroup || !tile) continue;
 
@@ -1763,11 +2045,11 @@
 					for (const pixel of tile.Pixels) {
 						const [x, y, color] = pixel;
 						const key = coordKey(x, y);
-						if (cache.targetKeys.has(key)) boardColors.set(key, toColorId(color));
+						if (cache.targetKeys.has(key)) colors.set(key, toColorId(color));
 					}
 				} else if (tile.Type === "full" && tile.ColorWebP) {
 					const imageData = await webpToImageData(tile.ColorWebP);
-					readFullTilePixels(tileX, tileY, imageData, targetGroup);
+					readFullTilePixels(tileX, tileY, imageData, targetGroup, colors);
 				}
 			}
 		}
@@ -1940,6 +2222,9 @@
 		const limit = settings.maxBatchSize || MAX_PIXELS_PER_REQUEST;
 		let salvoRemaining = 0;
 		let refreshBoardBeforeSend = false;
+		const automaticColors = settings.automaticPurchases.accountId !== null &&
+			settings.automaticPurchases.policy !== "off" &&
+			settings.automaticPurchases.enabled.includes("ExtraColor");
 		setButtons();
 
 		try {
@@ -1953,13 +2238,29 @@
 				if (remainingTargets.length > 0) hadPendingTargets = true;
 				updateProgress();
 
+				const automatic = await runAutomaticPurchases(remainingTargets.length > 0);
+				if (state.stopRequested) break;
+				if (automatic?.colorsChanged) {
+					await wait(COLOR_PURCHASE_PAUSE_MS);
+					if (state.stopRequested) break;
+					refreshBoardBeforeSend = false;
+					invalidateTargets();
+					await syncBoard();
+					continue;
+				}
 				if (!remainingTargets.length) {
-					setStatus("done", "Tous les pixels sélectionnés sont déjà corrects.");
+					if (automatic?.colorsOutstanding) {
+						setStatus("waiting", "En attente du déblocage des couleurs du dessin.");
+						await wait(EMPTY_ENERGY_PAUSE_MIN_MS);
+						continue;
+					}
+					setStatus("done", automaticColors ? "Aucun pixel accessible à peindre dans la sélection."
+						: "Tous les pixels sélectionnés sont déjà corrects.");
 					notifyCompletion();
 					break;
 				}
 
-				const reading = await fetchEnergySnapshot();
+				const reading = automatic?.reading ?? await fetchEnergySnapshot();
 				if (state.stopRequested) break;
 				state.nextBatchSize = 0;
 				if (reading.status === 401 || reading.status === 403) {
@@ -1999,7 +2300,10 @@
 							: "Recharge en cours…");
 					updateEnergyDisplay();
 					refreshBoardBeforeSend = true;
-					await wait(energyPollDelay(energy, threshold ?? 0));
+					const energyDelay = energyPollDelay(energy, threshold ?? 0);
+					const rechargeDelay = automatic?.purchased ? COLOR_PURCHASE_PAUSE_MS
+						: automatic ? Math.min(energyDelay, EMPTY_ENERGY_PAUSE_MIN_MS) : energyDelay;
+					await wait(rechargeDelay);
 					continue;
 				}
 				if (refreshBoardBeforeSend) {
@@ -2065,7 +2369,7 @@
 				}
 				updateProgress();
 
-				if (state.remaining === 0) {
+				if (state.remaining === 0 && !automaticColors) {
 					setStatus("done", "Tous les pixels sélectionnés ont été envoyés.");
 					notifyCompletion();
 					break;
@@ -2101,6 +2405,9 @@
 			await syncBoard();
 			const reading = await fetchEnergySnapshot();
 			if (reading.energy) state.energy = reading.energy;
+			const balance = automaticBalance(reading.data);
+			autoPurchases.balance = balance === null ? null : Math.floor(balance / 5);
+			renderAutomaticPurchases();
 			const remainingTargets = getRemainingTargets();
 			state.remaining = remainingTargets.length;
 			setStatus("idle", "Synchronisation terminée");
@@ -2135,6 +2442,7 @@
 		if (ui.buyColors) ui.buyColors.disabled = state.running;
 		if (ui.buyCapacity) ui.buyCapacity.disabled = state.running;
 		if (ui.energyControls) ui.energyControls.disabled = state.running;
+		if (ui.autoControls) ui.autoControls.disabled = state.running;
 	}
 
 	function updateEnergyDisplay() {
@@ -2180,6 +2488,101 @@
 			});
 		}
 		syncControls();
+	}
+
+	function renderAutomaticPurchases() {
+		if (!ui.autoControls) return;
+		const config = settings.automaticPurchases;
+		ui.autoBalance.textContent = autoPurchases.balance === null ? "—" : autoPurchases.balance + " Pixels";
+		ui.autoSpent.textContent = autoPurchases.spent + " Pixels";
+		ui.autoActive.textContent = config.order.filter((type) => config.enabled.includes(type))
+			.map((type) => AUTO_UPGRADES[type].label).join(" → ") || "Aucune";
+		ui.autoNext.textContent = autoPurchases.next || "—";
+		ui.autoMessage.textContent = autoPurchases.message || (config.policy === "off" ? "Achats désactivés."
+			: config.accountId === null ? "Autorisation requise." : "Achats autorisés pendant la peinture.");
+	}
+
+	function bindAutomaticPurchases() {
+		const policy = ui.autoControls.querySelector("#gpc-auto-policy");
+		const reserve = ui.autoControls.querySelector("#gpc-auto-reserve");
+		const limit = ui.autoControls.querySelector("#gpc-auto-limit");
+		const authorize = ui.autoControls.querySelector("#gpc-auto-authorize");
+		const rows = AUTO_UPGRADE_ORDER.map((type) => ({
+			type,
+			row: ui.autoControls.querySelector("#gpc-auto-row-" + type),
+			enabled: ui.autoControls.querySelector("#gpc-auto-enabled-" + type),
+			higher: ui.autoControls.querySelector("#gpc-auto-higher-" + type),
+		}));
+
+		const refreshControls = () => {
+			const config = settings.automaticPurchases;
+			policy.value = config.policy;
+			reserve.value = config.reserve;
+			limit.value = config.limit;
+			limit.disabled = config.policy !== "limited";
+			for (const { type, row, enabled, higher } of rows) {
+				const rank = config.order.indexOf(type);
+				row.style.order = rank;
+				enabled.checked = config.enabled.includes(type);
+				higher.disabled = rank === 0;
+			}
+			authorize.disabled = config.policy === "off" || !config.enabled.length;
+			authorize.textContent = config.accountId === null ? "Autoriser les achats" : "Retirer l’autorisation";
+			renderAutomaticPurchases();
+		};
+		const configure = (changes) => {
+			settings.automaticPurchases = normalizeAutomaticPurchases({
+				...settings.automaticPurchases, ...changes, accountId: null,
+			});
+			saveSettings();
+			autoPurchases.retryAt = 0;
+			updateAutomaticPurchases("");
+			refreshControls();
+		};
+		policy.addEventListener("change", () => configure({ policy: policy.value }));
+		reserve.addEventListener("change", () => configure({ reserve: reserve.value }));
+		limit.addEventListener("change", () => configure({ limit: limit.value }));
+		for (const { type, enabled, higher } of rows) {
+			enabled.addEventListener("change", () => {
+				const list = new Set(settings.automaticPurchases.enabled);
+				if (enabled.checked) list.add(type);
+				else list.delete(type);
+				configure({ enabled: [...list] });
+			});
+			higher.addEventListener("click", () => {
+				const order = [...settings.automaticPurchases.order];
+				const index = order.indexOf(type);
+				if (index === 0) return;
+				[order[index - 1], order[index]] = [order[index], order[index - 1]];
+				configure({ order });
+			});
+		}
+		authorize.addEventListener("click", () => {
+			const config = settings.automaticPurchases;
+			if (config.accountId !== null) {
+				configure({});
+				return;
+			}
+			const auth = getAuthPayload();
+			if (!auth.token || !Number.isSafeInteger(auth.userId) || auth.userId <= 0) {
+				updateAutomaticPurchases("Connectez-vous à GeoPixels pour autoriser les achats.");
+				return;
+			}
+			if (config.policy === "off" || !config.enabled.length) return;
+			const budget = config.policy === "limited" ? config.limit + " Pixels au total" : "illimité";
+			if (!win.confirm("Autoriser les achats automatiques en Pixels pour le compte GeoPixels " + auth.userId +
+				" pendant la peinture ? Budget " + budget + ", réserve de " + config.reserve + " Pixels.")) return;
+			config.accountId = auth.userId;
+			saveSettings();
+			updateAutomaticPurchases("Achats autorisés pendant la peinture.");
+			refreshControls();
+		});
+
+		const accountId = getAuthPayload().userId;
+		if (Number.isSafeInteger(accountId) && accountId > 0) {
+			try { autoPurchases.spent = readAutomaticPurchaseLedger(accountId).spent; } catch {}
+		}
+		refreshControls();
 	}
 
 	function updateProgress() {
@@ -2433,10 +2836,14 @@
 				padding-top: 10px;
 				border-top: 1px solid #273449;
 			}
-			#gpc-energy-controls { min-width: 0; padding: 0; margin: 7px 0 0; border: 0; }
+			#gpc-energy-controls, #gpc-auto-controls { min-width: 0; padding: 0; margin: 7px 0 0; border: 0; }
 			.gpc-energy-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
 			.gpc-energy-grid label { min-width: 0; display: grid; gap: 3px; }
 			.gpc-energy-summary { display: flex; flex-wrap: wrap; gap: 2px 9px; margin-bottom: 6px; }
+			.gpc-auto-summary { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 8px; margin: 7px 0; }
+			.gpc-auto-summary dd { margin: 0; overflow-wrap: anywhere; }
+			.gpc-auto-order { display: flex; flex-direction: column; gap: 4px; margin: 7px 0; }
+			.gpc-auto-order .gpc-row { justify-content: space-between; margin-top: 0; }
 			.gpc-check {
 				display: flex;
 				align-items: center;
@@ -2589,6 +2996,42 @@
 						</label>
 					</fieldset>
 				</details>
+				<details class="gpc-section">
+					<summary>Améliorations automatiques</summary>
+					<dl class="gpc-auto-summary">
+						<dt>Solde</dt><dd id="gpc-auto-balance"></dd>
+						<dt>Dépenses cumulées</dt><dd id="gpc-auto-spent"></dd>
+						<dt>Ordre actif</dt><dd id="gpc-auto-active"></dd>
+						<dt>Prochain achat</dt><dd id="gpc-auto-next"></dd>
+					</dl>
+					<div id="gpc-auto-message" class="gpc-muted" role="status"></div>
+					<fieldset id="gpc-auto-controls" aria-label="Améliorations automatiques">
+						<div class="gpc-energy-grid">
+							<label style="grid-column: 1 / -1;">Politique budgétaire
+								<select id="gpc-auto-policy" class="gpc-input">
+									<option value="off">Désactivé</option>
+									<option value="limited">Limité</option>
+									<option value="unlimited">Illimité</option>
+								</select>
+							</label>
+							<label>Réserve de Pixels
+								<input id="gpc-auto-reserve" class="gpc-input" type="number" min="0" step="1">
+							</label>
+							<label>Plafond cumulé
+								<input id="gpc-auto-limit" class="gpc-input" type="number" min="0" step="1">
+							</label>
+						</div>
+						<div class="gpc-auto-order">
+							${Object.entries(AUTO_UPGRADES).map(([type, { label }]) => `
+								<div class="gpc-row" id="gpc-auto-row-${type}">
+									<label class="gpc-check"><input id="gpc-auto-enabled-${type}" type="checkbox"> ${label}</label>
+									<button id="gpc-auto-higher-${type}" class="gpc-btn" type="button" aria-label="Monter dans l’ordre : ${label}">↑</button>
+								</div>
+							`).join("")}
+						</div>
+						<button id="gpc-auto-authorize" class="gpc-btn" type="button"></button>
+					</fieldset>
+				</details>
 				<div class="gpc-row">
 					<label class="gpc-check"><input id="gpc-free" type="checkbox"> Couleurs gratuites</label>
 					<label class="gpc-check"><input id="gpc-alpha" type="checkbox"> Couleurs transparentes</label>
@@ -2675,6 +3118,12 @@
 		ui.salvoState = panel.querySelector("#gpc-salvo-state");
 		ui.energyThreshold = panel.querySelector("#gpc-energy-threshold");
 		ui.nextBatchSize = panel.querySelector("#gpc-next-batch");
+		ui.autoControls = panel.querySelector("#gpc-auto-controls");
+		ui.autoBalance = panel.querySelector("#gpc-auto-balance");
+		ui.autoSpent = panel.querySelector("#gpc-auto-spent");
+		ui.autoActive = panel.querySelector("#gpc-auto-active");
+		ui.autoNext = panel.querySelector("#gpc-auto-next");
+		ui.autoMessage = panel.querySelector("#gpc-auto-message");
 		ui.etaText = panel.querySelector("#gpc-eta");
 		ui.free = panel.querySelector("#gpc-free");
 		ui.alpha = panel.querySelector("#gpc-alpha");
@@ -2705,6 +3154,7 @@
 		ui.smartPriority.checked = !!settings.smartPriority;
 		ui.wrongColorPriority.checked = !!settings.prioritizeIncorrectColors;
 		bindEnergySettings();
+		bindAutomaticPurchases();
 		panel.classList.toggle("gpc-min", !!settings.minimized);
 		ui.min.textContent = settings.minimized ? "+" : "-";
 		ui.min.title = settings.minimized ? "Développer" : "Réduire";

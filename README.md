@@ -25,7 +25,19 @@ Le panneau affiche l’énergie actuelle et maximale, la phase de la salve, le s
 
 Si le résultat d’un envoi est incertain, le script s’arrête. Le bouton **Démarrer** resynchronise alors la carte avant de reprendre. En cas de limitation des envois, le délai indiqué par GeoPixels est respecté avant la reprise. Utilisez un seul onglet pour peindre avec un même compte, car l’énergie est partagée entre les onglets.
 
-Les tests locaux se lancent avec `node --test tests/energy.test.cjs`. Ils simulent GeoPixels et Tampermonkey, y compris les réponses réseau.
+### Améliorations automatiques
+
+Dans **Améliorations automatiques**, cochez les achats souhaités et remontez les plus importants avec les flèches. Choisissez ensuite une politique et cliquez sur **Autoriser les achats**. L’autorisation est enregistrée pour le compte GeoPixels actif. Toute modification des réglages d’achat demande une nouvelle autorisation. Les achats sont désactivés par défaut et s’exécutent pendant la peinture, y compris pendant l’attente d’une salve.
+
+- **Désactivé** suspend les achats automatiques.
+- **Limité** fixe un plafond cumulé par compte, conservé entre les sessions.
+- **Illimité** utilise les Pixels disponibles au-delà de la réserve. Une réserve de `0` permet de dépenser le solde disponible. Si l’amélioration prioritaire dépasse le budget, le script attend que le solde le permette.
+
+Le script lit les tarifs affichés dans la [boutique GeoPixels](https://geopixels.net/) et les données du compte. Il achète une unité à la fois. La vitesse s’arrête au minimum affiché. Pour les couleurs, il tient compte des déblocages gratuits du profil et vérifie sur la carte qu’au moins un pixel sélectionné en a besoin. La recharge de 20 points peut dépasser la capacité lorsque GeoPixels le permet. L’automatisation dépense uniquement les Pixels du jeu.
+
+Le panneau affiche le solde lu, l’ordre actif, le prochain achat, les dépenses confirmées et les blocages. Une confirmation exige une réponse HTTP 200 puis la vérification du débit et de l’amélioration. Une tentative sans confirmation reste en suspens après un rechargement. Si le serveur a renvoyé HTTP 200, une lecture ultérieure du compte peut encore confirmer l’achat. Si la boutique ne fournit plus de tarif lisible ou si le navigateur ne fournit pas le verrou inter-onglets, les achats automatiques sont suspendus. Pour que la vérification des débits reste fiable, effectuez les achats manuels après l’arrêt de la peinture.
+
+Les tests locaux se lancent avec `node --test tests/energy.test.cjs`. Ils simulent GeoPixels et Tampermonkey, y compris les réponses réseau et les achats, en utilisant uniquement des comptes fictifs.
 
 ## Stockage et session
 

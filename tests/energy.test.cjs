@@ -8,13 +8,25 @@ const source = fs.readFileSync(path.join(__dirname, "../ghostpixel-bot-clean.use
 const settingsKey = "ghostpixel_clean_settings";
 const flush = () => new Promise(setImmediate);
 
-async function fixture({ pixels = 20, energy = 10, capacity = 10, settings = {}, bridge = true } = {}) {
+async function fixture({
+	pixels = 20, energy = 10, capacity = 10, settings = {}, bridge = true,
+	balance = 50, rate = 15, palette = [0xFFFFFF], template, ledger, allow = true,
+} = {}) {
 	const nodes = new Map();
 	const timers = new Map();
 	const requests = [];
+	const purchases = [];
+	const confirmations = [];
 	const notifications = [];
 	const painted = new Map();
-	const account = { energy, capacity, paintResponses: [], status: 200, date: null, tick: 1, rate: 15 };
+	const account = { energy, capacity, balance, colors: [...palette], paintResponses: [], purchaseResponses: [], status: 200, date: null, tick: 1, rate };
+	const tariffs = { FasterRecharge: 500, EnergyCapacity: 50, Energy: 10, ExtraColor: 100 };
+	const shop = new Map([
+		["FasterRechargeInput", () => tariffs.FasterRecharge + " Pixels / -1s (cap at 15s)"],
+		["EnergyCapacityInput", () => tariffs.EnergyCapacity + " Pixels / +5 max"],
+		["EnergyInput", () => tariffs.Energy + " Pixels / +20 energy"],
+		["ExtraColorInput", () => tariffs.ExtraColor + " Pixels / Any hex color allowed"],
+	]);
 	let activeRequests = 0;
 	let maxActiveRequests = 0;
 	let nextTimer = 0;
@@ -26,10 +38,11 @@ async function fixture({ pixels = 20, energy = 10, capacity = 10, settings = {},
 	}
 	const storage = new Storage();
 	storage.setItem(settingsKey, JSON.stringify(settings));
+	if (ledger) storage.setItem(settingsKey + "_purchases_7", ledger);
 
 	function createElement(tag) {
 		return {
-			tag, value: "", dataset: {}, style: {}, classList: { toggle() {} },
+			tag, value: "", dataset: {}, style: { setProperty() {} }, classList: { toggle() {} },
 			events: {},
 			addEventListener(name, listener) { this.events[name] = listener; },
 			getBoundingClientRect: () => ({ width: 320, height: 460, top: 10, left: 10 }),
@@ -57,15 +70,34 @@ async function fixture({ pixels = 20, energy = 10, capacity = 10, settings = {},
 		if (url === "/GetUserData") {
 			return reply(account.status, {
 				energy: account.reportedEnergy ?? account.energy, maxEnergy: account.capacity, checkedTick: account.tick,
-				energyRate: account.rate, pixels: 250,
+				energyRate: account.rate, pixels: account.balance * 5, colors: [...account.colors],
 			}, { Date: account.date, "Retry-After": account.readRetryAfter });
 		}
 		if (url === "/GetPixelsCached") {
 			const tiles = Object.fromEntries(body.Tiles.map(({ x, y }) => [
 				x + "_" + y,
-				{ Type: "delta", Pixels: [...painted.values()].filter(([gridX]) => Math.floor(gridX / 1000) * 1000 === x) },
+				{ Type: "delta", Pixels: Array.from({ length: Math.max(0, Math.min(1000, pixels - x)) },
+					(_, offset) => painted.get((x + offset) + "," + y) ?? [x + offset, y, -1]) },
 			]));
 			return reply(200, { ServerTimestamp: 1, Tiles: tiles });
+		}
+		if (url === "/MakePurchase") {
+			assert.ok(init.signal instanceof AbortSignal);
+			const { type, amount } = body;
+			purchases.push({ type, amount });
+			const response = account.purchaseResponses.shift() ?? {};
+			if (response.change) response.change(account);
+			if (!response.status && !response.throws && !response.noEffect) {
+				const cost = type === "ExtraColor" && account.colors.length < 34 ? 0 : tariffs[type];
+				assert.ok(account.balance >= cost);
+				account.balance -= cost;
+				if (type === "FasterRecharge") account.rate--;
+				if (type === "EnergyCapacity") account.capacity += 5;
+				if (type === "Energy") account.energy += 20;
+				if (type === "ExtraColor") account.colors.push(amount);
+			}
+			if (response.throws) throw new TypeError("connection interrupted during purchase");
+			return reply(response.status, response.text, response.headers);
 		}
 		assert.equal(url, "/PlacePixels");
 		assert.ok(init.signal instanceof AbortSignal);
@@ -101,16 +133,22 @@ async function fixture({ pixels = 20, energy = 10, capacity = 10, settings = {},
 		},
 		clearTimeout: (id) => timers.delete(id),
 		GM_notification: (notification) => notifications.push(notification),
+		navigator: { locks: { request: async (_name, _options, task) => task({}) } },
+		confirm(message) { confirmations.push(message); return allow; },
 		userID: 7, tokenUser: "local-fixture", subject: "local-fixture",
 		currentEnergy: energy, maxEnergy: capacity, energyRate: account.rate,
-		Colors: ["#FFFFFF"],
-		ghostImageOriginalData: { width: pixels, data: new Uint8Array(pixels * 4).fill(255) },
+		Colors: palette,
+		ghostImageOriginalData: { width: pixels, data: template ?? new Uint8Array(pixels * 4).fill(255) },
 		ghostImageTopLeft: { x: 0, y: 0 },
 	});
 	context.window = context;
 	context.document = {
 		readyState: "complete", createElement,
-		getElementById: () => undefined,
+		getElementById(id) {
+			if (id === "freeColorNotice") return {};
+			const quote = shop.get(id);
+			if (quote) return { parentElement: { parentElement: { children: [{ textContent: quote() }] } } };
+		},
 		body: { appendChild() {} },
 		head: {
 			appendChild(element) {
@@ -122,7 +160,7 @@ async function fixture({ pixels = 20, energy = 10, capacity = 10, settings = {},
 	await flush();
 
 	return {
-		account, requests, notifications, storage,
+		account, requests, purchases, confirmations, notifications, storage, painted, shop, tariffs,
 		bot: context.ghostBot,
 		maxActiveRequests: () => maxActiveRequests,
 		node: (name) => nodes.get("#gpc-" + name),
@@ -141,7 +179,7 @@ const sizes = (session, ...expected) => assert.deepEqual(session.requests, expec
 
 test("les salves par défaut attendent la pleine capacité, y compris après une augmentation", async () => {
 	const s = await fixture({ energy: 9, pixels: 15, settings: { minimized: true } });
-	assert.equal(s.bot.version, "1.1.11");
+	assert.equal(s.bot.version, "1.1.12");
 	assert.equal(s.bot.settings().energyMode, "salvos");
 	assert.equal(s.bot.settings().minimized, true);
 	const run = s.bot.start();
@@ -321,4 +359,184 @@ test("un seuil en pourcentage s’arrondit à l’unité supérieure sans ajoute
 	assert.equal(rounded.node("energy-threshold").textContent, 8);
 	rounded.bot.stop();
 	await run;
+});
+
+const automatic = (enabled, overrides = {}) => ({
+	policy: "unlimited", reserve: 0, limit: 0, enabled, accountId: 7, ...overrides,
+});
+const purchaseLedger = (session) => JSON.parse(session.storage.getItem(settingsKey + "_purchases_7"));
+
+test("les achats exigent une autorisation explicite et toute modification la retire", async () => {
+	const s = await fixture({ pixels: 1, balance: 100, settings: {
+		automaticPurchases: automatic(["EnergyCapacity"], { accountId: null }),
+	} });
+	assert.equal(s.confirmations.length, 0);
+	await s.bot.start();
+	assert.deepEqual(s.purchases, []);
+	s.node("auto-authorize").events.click();
+	assert.equal(s.confirmations.length, 1);
+	assert.equal(s.bot.settings().automaticPurchases.accountId, 7);
+	s.node("auto-higher-EnergyCapacity").events.click();
+	assert.equal(s.bot.settings().automaticPurchases.order[0], "EnergyCapacity");
+	assert.equal(s.bot.settings().automaticPurchases.accountId, null);
+	const denied = await fixture({ allow: false, settings: {
+		automaticPurchases: automatic(["Energy"], { accountId: null }),
+	} });
+	denied.node("auto-authorize").events.click();
+	assert.equal(denied.bot.settings().automaticPurchases.accountId, null);
+});
+
+test("le mode illimité dépense selon la priorité et réévalue pendant l’attente d’une salve", async () => {
+	const s = await fixture({ energy: 0, capacity: 50, rate: 17, balance: 1060, settings: {
+		automaticPurchases: automatic(["FasterRecharge", "EnergyCapacity", "Energy"], { reserve: 10 }),
+	} });
+	const run = s.bot.start();
+	await flush();
+	assert.deepEqual(s.purchases, [{ type: "FasterRecharge", amount: 1 }]);
+	await s.advance(1200);
+	await s.advance(1200);
+	assert.deepEqual(s.purchases.map(({ type }) => type), ["FasterRecharge", "FasterRecharge", "EnergyCapacity"]);
+	assert.equal(s.account.rate, 15);
+	assert.equal(s.account.capacity, 55);
+	assert.equal(s.account.balance, 10);
+	assert.equal(purchaseLedger(s).spent, 1050);
+	await s.advance(1200);
+	assert.match(s.node("auto-message").textContent, /solde insuffisant/i);
+	assert.match(s.node("auto-next").textContent, /Capacité énergétique/);
+	assert.equal(s.node("energy").textContent, "0 / 55");
+	sizes(s);
+	s.bot.stop();
+	await run;
+});
+
+test("le plafond limité et la réserve utilisent le tarif affiché et les dépenses cumulées", async () => {
+	const config = automatic(["EnergyCapacity"], { policy: "limited", limit: 120, reserve: 20 });
+	const s = await fixture({ energy: 0, balance: 150, settings: { automaticPurchases: config } });
+	s.tariffs.EnergyCapacity = 60;
+	const run = s.bot.start();
+	await flush();
+	await s.advance(1200);
+	await s.advance(1200);
+	assert.equal(s.purchases.length, 2);
+	assert.equal(s.account.balance, 30);
+	assert.equal(s.node("auto-spent").textContent, "120 Pixels");
+	s.account.balance = 100;
+	await s.advance(15000);
+	assert.equal(s.purchases.length, 2);
+	assert.match(s.node("auto-message").textContent, /plafond cumulé/i);
+	const journal = s.storage.getItem(settingsKey + "_purchases_7");
+	s.bot.stop();
+	await run;
+
+	const reloaded = await fixture({ energy: 0, balance: 100, ledger: journal, settings: { automaticPurchases: config } });
+	const resumed = reloaded.bot.start();
+	await flush();
+	assert.deepEqual(reloaded.purchases, []);
+	assert.equal(reloaded.node("auto-spent").textContent, "120 Pixels");
+	reloaded.bot.stop();
+	await resumed;
+});
+
+test("la recharge confirmée ajoute 20 points avant que la salve puisse peindre", async () => {
+	const s = await fixture({ energy: 0, capacity: 15, balance: 10, pixels: 1, bridge: false, settings: {
+		automaticPurchases: automatic(["Energy"]),
+	} });
+	await s.bot.start();
+	assert.deepEqual(s.purchases, [{ type: "Energy", amount: 1 }]);
+	assert.equal(s.account.energy, 19);
+	assert.equal(s.account.balance, 0);
+	assert.equal(purchaseLedger(s).spent, 10);
+	sizes(s, 1);
+});
+
+test("les couleurs sont vérifiées sur la carte et les déblocages gratuits restent possibles sans Pixels", async () => {
+	const s = await fixture({
+		pixels: 4, balance: 0,
+		template: new Uint8Array([255, 255, 255, 255, 0x12, 0x34, 0x56, 255, 0x65, 0x43, 0x21, 255, 0x32, 0x54, 0x76, 255]),
+		settings: { ignoredColors: ["#325476"], automaticPurchases: automatic(["ExtraColor"]) },
+	});
+	s.painted.set("1,0", [1, 0, 0x123456]);
+	const run = s.bot.start();
+	await flush();
+	assert.deepEqual(s.purchases, [{ type: "ExtraColor", amount: 0x654321 }]);
+	assert.equal(purchaseLedger(s).spent, 0);
+	await s.advance(1200);
+	sizes(s, 2);
+	await s.advance(1200);
+	await run;
+	assert.equal(s.purchases.length, 1);
+	assert.equal(s.painted.get("2,0")[2], 0x654321);
+	assert.equal(s.painted.has("3,0"), false);
+});
+
+test("une couleur payante respecte la réserve et utilise le tarif affiché", async () => {
+	const fullPalette = [0xFFFFFF, ...Array.from({ length: 33 }, (_, index) => index)];
+	const s = await fixture({
+		pixels: 1, energy: 0, balance: 100, palette: fullPalette,
+		template: new Uint8Array([0x12, 0x34, 0x56, 255]),
+		settings: { automaticPurchases: automatic(["ExtraColor"], { reserve: 5 }) },
+	});
+	const run = s.bot.start();
+	await flush();
+	assert.deepEqual(s.purchases, []);
+	assert.match(s.node("auto-next").textContent, /100 Pixels/);
+	s.account.balance = 105;
+	await s.advance(15000);
+	assert.deepEqual(s.purchases, [{ type: "ExtraColor", amount: 0x123456 }]);
+	assert.equal(s.account.balance, 5);
+	assert.equal(purchaseLedger(s).spent, 100);
+	s.bot.stop();
+	await run;
+});
+
+test("une réponse supposée favorable sans effet vérifié bloque toute répétition après rechargement", async () => {
+	const config = automatic(["EnergyCapacity"], { policy: "limited", limit: 50 });
+	const s = await fixture({ energy: 0, balance: 100, settings: { automaticPurchases: config } });
+	s.account.purchaseResponses.push({ noEffect: true });
+	const run = s.bot.start();
+	await flush();
+	assert.equal(s.purchases.length, 1);
+	assert.equal(purchaseLedger(s).spent, 0);
+	assert.match(s.node("auto-message").textContent, /résultat non confirmé/i);
+	const journal = s.storage.getItem(settingsKey + "_purchases_7");
+	assert.equal(purchaseLedger(s).pending.type, "EnergyCapacity");
+	s.bot.stop();
+	await run;
+
+	const reloaded = await fixture({ energy: 0, balance: 100, ledger: journal, settings: { automaticPurchases: config } });
+	const resumed = reloaded.bot.start();
+	await flush();
+	assert.deepEqual(reloaded.purchases, []);
+	assert.match(reloaded.node("auto-message").textContent, /achat précédent non confirmé/i);
+	reloaded.account.capacity = 15;
+	reloaded.account.balance = 50;
+	await reloaded.advance(15000);
+	assert.equal(purchaseLedger(reloaded).spent, 50);
+	assert.equal(purchaseLedger(reloaded).pending, null);
+	assert.deepEqual(reloaded.purchases, []);
+	reloaded.bot.stop();
+	await resumed;
+});
+
+test("un délai réseau ambigu n’essaie jamais un autre chemin d’achat", async () => {
+	const s = await fixture({ energy: 0, balance: 100, settings: { automaticPurchases: automatic(["EnergyCapacity"]) } });
+	s.account.purchaseResponses.push({ throws: true });
+	const run = s.bot.start();
+	await flush();
+	assert.equal(s.purchases.length, 1);
+	assert.equal(purchaseLedger(s).pending.type, "EnergyCapacity");
+	await s.advance(15000);
+	assert.equal(s.purchases.length, 1);
+	s.bot.stop();
+	await run;
+});
+
+test("l’absence d’un tarif exploitable bloque l’achat prioritaire", async () => {
+	const s = await fixture({ pixels: 1, balance: 100, settings: {
+		automaticPurchases: automatic(["EnergyCapacity", "Energy"]),
+	} });
+	s.shop.delete("EnergyCapacityInput");
+	await s.bot.start();
+	assert.deepEqual(s.purchases, []);
+	assert.match(s.node("auto-message").textContent, /non vérifiable/i);
 });
