@@ -11,10 +11,13 @@ const flush = () => new Promise(setImmediate);
 async function fixture({
 	pixels = 20, energy = 10, capacity = 10, settings = {}, bridge = true,
 	balance = 50, rate = 15, palette = [0xFFFFFF], template, ledger, allow = true,
+	templateWidth = pixels, topLeft = { x: 0, y: 0 }, decodedTiles,
 } = {}) {
 	const nodes = new Map();
 	const timers = new Map();
 	const requests = [];
+	const sent = [];
+	const tileReads = [];
 	const purchases = [];
 	const confirmations = [];
 	const notifications = [];
@@ -30,6 +33,7 @@ async function fixture({
 	let activeRequests = 0;
 	let maxActiveRequests = 0;
 	let nextTimer = 0;
+	let now = Date.now();
 
 	class Storage {
 		constructor() { this.data = new Map(); }
@@ -41,9 +45,18 @@ async function fixture({
 	if (ledger) storage.setItem(settingsKey + "_purchases_7", ledger);
 
 	function createElement(tag) {
+		if (tag === "canvas" && decodedTiles) {
+			let tile;
+			return { getContext: () => ({
+				translate() {}, scale() {},
+				drawImage(image) { tile = decodedTiles.get(image.tile); },
+				getImageData: () => ({ data: tile }),
+			}) };
+		}
 		return {
 			tag, value: "", dataset: {}, style: { setProperty() {} }, classList: { toggle() {} },
 			events: {},
+			setAttribute() {},
 			addEventListener(name, listener) { this.events[name] = listener; },
 			getBoundingClientRect: () => ({ width: 320, height: 460, top: 10, left: 10 }),
 			querySelector(selector) {
@@ -74,6 +87,8 @@ async function fixture({
 			}, { Date: account.date, "Retry-After": account.readRetryAfter });
 		}
 		if (url === "/GetPixelsCached") {
+			tileReads.push(body.Tiles);
+			if (account.readTiles) return reply(200, account.readTiles(body.Tiles));
 			const tiles = Object.fromEntries(body.Tiles.map(({ x, y }) => [
 				x + "_" + y,
 				{ Type: "delta", Pixels: Array.from({ length: Math.max(0, Math.min(1000, pixels - x)) },
@@ -102,6 +117,7 @@ async function fixture({
 		assert.equal(url, "/PlacePixels");
 		assert.ok(init.signal instanceof AbortSignal);
 		const batch = body.Pixels;
+		sent.push(batch.map(({ GridX, GridY }) => [GridX, GridY]));
 		requests.push(batch.length);
 		activeRequests++;
 		maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
@@ -114,7 +130,7 @@ async function fixture({
 				for (const { GridX, GridY, Color } of batch) painted.set(GridX + "," + GridY, [GridX, GridY, Color]);
 			}
 			if (outcome.throws) throw new TypeError("connection interrupted");
-			return reply(outcome.status, outcome.text, outcome.headers);
+			return reply(outcome.status, outcome.text ?? "Ok", outcome.headers);
 		} finally {
 			activeRequests--;
 		}
@@ -123,10 +139,17 @@ async function fixture({
 	const context = vm.createContext({
 		console: { log() {}, warn() {}, error() {} },
 		URL, AbortSignal, fetch, Storage, localStorage: storage,
+		Date: class extends Date { static now() { return now; } },
+		Image: class {
+			naturalWidth = 1000;
+			naturalHeight = 1000;
+			set src(value) { this.tile = value.split(",")[1]; this.onload(); }
+		},
 		location: new URL("https://geopixels.net/"),
 		innerWidth: 1000, innerHeight: 700,
 		addEventListener() {},
 		setTimeout(callback, ms) {
+			if (ms === 0) { queueMicrotask(callback); return 0; }
 			if (ms === 500) return 0; // Le chargement asynchrone de la carte est hors de ce test.
 			timers.set(++nextTimer, { callback, ms });
 			return nextTimer;
@@ -138,8 +161,8 @@ async function fixture({
 		userID: 7, tokenUser: "local-fixture", subject: "local-fixture",
 		currentEnergy: energy, maxEnergy: capacity, energyRate: account.rate,
 		Colors: palette,
-		ghostImageOriginalData: { width: pixels, data: template ?? new Uint8Array(pixels * 4).fill(255) },
-		ghostImageTopLeft: { x: 0, y: 0 },
+		ghostImageOriginalData: { width: templateWidth, data: template ?? new Uint8Array(pixels * 4).fill(255) },
+		ghostImageTopLeft: topLeft,
 	});
 	context.window = context;
 	context.document = {
@@ -160,15 +183,18 @@ async function fixture({
 	await flush();
 
 	return {
-		account, requests, purchases, confirmations, notifications, storage, painted, shop, tariffs,
+		account, requests, sent, tileReads, purchases, confirmations, notifications, storage, painted, shop, tariffs,
 		bot: context.ghostBot,
 		maxActiveRequests: () => maxActiveRequests,
 		node: (name) => nodes.get("#gpc-" + name),
+		setTemplate(data) { context.ghostImageOriginalData = { width: templateWidth, data }; },
+		elapse(ms) { now += ms; },
 		async advance(expectedMs) {
 			assert.equal(timers.size, 1);
 			const [[id, { callback, ms }]] = timers;
 			assert.equal(ms, expectedMs);
 			timers.delete(id);
+			now += ms;
 			callback();
 			await flush();
 		},
@@ -179,7 +205,7 @@ const sizes = (session, ...expected) => assert.deepEqual(session.requests, expec
 
 test("les salves par défaut attendent la pleine capacité, y compris après une augmentation", async () => {
 	const s = await fixture({ energy: 9, pixels: 15, settings: { minimized: true } });
-	assert.equal(s.bot.version, "1.1.12");
+	assert.equal(s.bot.version, "1.1.13");
 	assert.equal(s.bot.settings().energyMode, "salvos");
 	assert.equal(s.bot.settings().minimized, true);
 	const run = s.bot.start();
@@ -539,4 +565,159 @@ test("l’absence d’un tarif exploitable bloque l’achat prioritaire", async 
 	await s.bot.start();
 	assert.deepEqual(s.purchases, []);
 	assert.match(s.node("auto-message").textContent, /non vérifiable/i);
+});
+
+test("une observation partielle sépare les pixels confirmés, incorrects, vides et inconnus", async () => {
+	const s = await fixture({ pixels: 4 });
+	s.account.readTiles = () => ({
+		ServerTimestamp: 20,
+		Tiles: { "0_0": { Type: "delta", Pixels: [...[
+			[0, 0, 0xFFFFFF], [1, 0, 0], [2, 0, -1], [null, 0, 0], [3, 0, 1.5],
+		], ...s.painted.values()] } },
+	});
+	await s.bot.sync();
+	assert.equal(s.node("count").textContent, "1 / 4");
+	assert.equal(s.node("wrong-count").textContent, "1");
+	assert.equal(s.node("empty-count").textContent, "1");
+	assert.equal(s.node("unknown-count").textContent, "1");
+	assert.equal(s.node("eta").textContent, "—");
+	const run = s.bot.start();
+	await flush();
+	await s.advance(1200);
+	await run;
+	assert.deepEqual(s.sent, [[[1, 0], [2, 0]]]);
+	assert.ok(s.tileReads.every(([tile]) => tile.timestamp === 0));
+	assert.equal(s.node("count").textContent, "3 / 4");
+	assert.match(s.node("message").textContent, /non observés/);
+	assert.equal(s.notifications.length, 0);
+});
+
+test("les compteurs réagissent aux seuls deltas et ignorent une réponse plus ancienne", async () => {
+	const s = await fixture({ pixels: 3 });
+	let version = 0;
+	const edits = [
+		{ stamp: 20, pixels: [[0, 0, 0xFFFFFF], [1, 0, 0], [2, 0, -1]] },
+		{ stamp: 21, pixels: [[1, 0, 0xFFFFFF]] },
+		{ stamp: 19, pixels: [[0, 0, 0]] },
+	];
+	s.account.readTiles = () => {
+		const { stamp, pixels } = edits[version++];
+		return { ServerTimestamp: stamp, Tiles: { "0_0": { Type: "delta", Pixels: pixels } } };
+	};
+	await s.bot.sync();
+	await s.bot.sync();
+	await s.bot.sync();
+	assert.deepEqual(s.tileReads.map(([tile]) => tile.timestamp), [0, 20, 21]);
+	assert.equal(s.node("count").textContent, "2 / 3");
+	assert.equal(s.node("wrong-count").textContent, "0");
+	assert.equal(s.node("empty-count").textContent, "1");
+	assert.equal(s.node("unknown-count").textContent, "0");
+});
+
+test("les tuiles complètes respectent les limites et l’orientation des coordonnées négatives", async () => {
+	const decodedTiles = new Map();
+	for (const [x, y, rgba] of [
+		[-1, 0, [255, 255, 255, 255]], [0, 0, [0, 0, 0, 255]],
+		[-1, -1, [0, 0, 0, 0]], [0, -1, [255, 255, 255, 255]],
+	]) {
+		const originX = Math.floor(x / 1000) * 1000;
+		const originY = Math.floor(y / 1000) * 1000;
+		const data = new Uint8Array(1000 * 1000 * 4);
+		const offset = ((originY + 999 - y) * 1000 + x - originX) * 4;
+		data.set(rgba, offset);
+		decodedTiles.set(originX + "_" + originY, data);
+	}
+	const s = await fixture({ pixels: 4, templateWidth: 2, topLeft: { x: -1, y: 0 }, decodedTiles });
+	s.account.readTiles = (tiles) => ({
+		ServerTimestamp: 30,
+		Tiles: Object.fromEntries(tiles.map(({ x, y }) => [
+			x + "_" + y, { Type: "full", ColorWebP: x + "_" + y },
+		])),
+	});
+	await s.bot.sync();
+	assert.equal(s.tileReads[0].length, 4);
+	assert.equal(s.node("count").textContent, "2 / 4");
+	assert.equal(s.node("wrong-count").textContent, "1");
+	assert.equal(s.node("empty-count").textContent, "1");
+	assert.equal(s.node("unknown-count").textContent, "0");
+});
+
+test("la priorité intelligente conserve la taille des régions à travers les frontières des tuiles", async () => {
+	const pixels = 1003;
+	const template = new Uint8Array(pixels * 4).fill(255);
+	for (const x of [998, 999, 1000, 1002]) template.set([0x12, 0x34, 0x56, 255], x * 4);
+	template.set([0x56, 0x34, 0x12, 255], 1001 * 4);
+	const s = await fixture({ pixels, template, energy: 5, capacity: 5, palette: [0xFFFFFF, 0x123456, 0x563412] });
+	const run = s.bot.start();
+	await flush();
+	assert.deepEqual(s.sent, [[[1001, 0], [1002, 0], [998, 0], [999, 0], [1000, 0]]]);
+	assert.equal(s.node("count").textContent, "5 / " + new Intl.NumberFormat("fr-FR").format(pixels));
+	s.bot.stop();
+	await run;
+});
+
+test("les pixels incorrects prennent la priorité sur les pixels vides si l’option est active", async () => {
+	const s = await fixture({ pixels: 3, energy: 1, capacity: 1, settings: { prioritizeIncorrectColors: true } });
+	s.painted.set("2,0", [2, 0, 0]);
+	const run = s.bot.start();
+	await flush();
+	assert.deepEqual(s.sent, [[[2, 0]]]);
+	s.bot.stop();
+	await run;
+});
+
+test("un pixel modifié après acceptation est signalé et ne repart pas dans la même session", async () => {
+	const s = await fixture({ pixels: 2, energy: 2, capacity: 2, settings: { maxBatchSize: 1 } });
+	const run = s.bot.start();
+	await flush();
+	assert.deepEqual(s.sent, [[[0, 0]]]);
+	s.painted.delete("0,0");
+	s.elapse(30000);
+	await s.advance(1200);
+	assert.deepEqual(s.sent, [[[0, 0]], [[1, 0]]]);
+	s.account.energy = 2;
+	await s.advance(1200);
+	await run;
+	assert.equal(s.sent.length, 2);
+	assert.match(s.node("message").textContent, /déjà envoyés ont changé/);
+	assert.equal(s.node("count").textContent, "1 / 2");
+});
+
+test("un nouveau modèle de même taille remplace le cache pendant un envoi", async () => {
+	const s = await fixture({ pixels: 1, energy: 2, capacity: 2, palette: [0xFFFFFF, 0x123456] });
+	let release;
+	s.account.paintResponses.push({ wait: new Promise((resolve) => { release = resolve; }) });
+	const run = s.bot.start();
+	await flush();
+	s.setTemplate(new Uint8Array([0x12, 0x34, 0x56, 255]));
+	release();
+	await flush();
+	await s.advance(1200);
+	await run;
+	assert.equal(s.sent.length, 2);
+	assert.equal(s.painted.get("0,0")[2], 0x123456);
+});
+
+test("une réponse HTTP réussie sans confirmation GeoPixels laisse le groupe non observé", async () => {
+	const s = await fixture({ pixels: 1 });
+	s.account.paintResponses.push({ status: 200, text: "Incomplete" });
+	await s.bot.start();
+	sizes(s, 1);
+	assert.equal(s.node("count").textContent, "0 / 1");
+	assert.equal(s.node("unknown-count").textContent, "1");
+	assert.match(s.node("message").textContent, /résultat de l’envoi incertain/i);
+	assert.equal(s.notifications.length, 0);
+});
+
+test("l’estimation utilise le débit observé et affiche les durées longues en jours et heures", async () => {
+	const s = await fixture({ pixels: 4, energy: 4, capacity: 4, settings: { maxBatchSize: 1 } });
+	const run = s.bot.start();
+	await flush();
+	assert.equal(s.node("eta").textContent, "—");
+	s.elapse(3 * 86400 * 1000);
+	await s.advance(1200);
+	assert.match(s.node("eta").textContent, /^3 j 0 h$/);
+	assert.match(s.node("rate").textContent, /px\/min$/);
+	s.bot.stop();
+	await run;
 });

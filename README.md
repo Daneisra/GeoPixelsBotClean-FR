@@ -39,6 +39,34 @@ Le panneau affiche le solde lu, l’ordre actif, le prochain achat, les dépense
 
 Les tests locaux se lancent avec `node --test tests/energy.test.cjs`. Ils simulent GeoPixels et Tampermonkey, y compris les réponses réseau et les achats, en utilisant uniquement des comptes fictifs.
 
+### Grands modèles et progression
+
+Le panneau sépare les pixels confirmés, incorrects, vides et non observés. Les pixels non observés restent dans le total restant et ne sont pas envoyés. Les tuiles sont actualisées par deltas quand un historique complet est disponible. Pendant une séquence d’envois, le script synchronise à intervalles de 30 secondes et avant de reprendre après une attente de recharge. Une réponse de placement sans confirmation déclenche une nouvelle lecture des tuiles concernées au redémarrage. Une modification externe détectée après confirmation peut être traitée au démarrage suivant.
+
+Le temps estimé utilise le débit des groupes confirmés et tient compte du temps d’attente écoulé. L’estimation apparaît dès que deux groupes et deux secondes ont été observés, si tous les pixels restants sont connus. Les grands compteurs sont espacés par milliers. Le bouton **Arrêter** reste accessible pendant le défilement des réglages.
+
+#### Mesures locales
+
+Le [banc d’essai](tests/benchmark.cjs) utilise un modèle synthétique de 1 500 × 1 500 pixels, la priorité intelligente activée et des réponses réseau simulées. Les tuiles sont fournies sous forme de pixels déjà décodés. Les résultats mesurent le travail du userscript sous Node.js 22.23 et excluent la latence réseau, le décodage WebP et le rendu de la carte.
+
+| Traitement | v1.1.12 | v1.1.13 |
+| --- | ---: | ---: |
+| Analyse et tri initiaux | 14,60 s | 2,62 s |
+| Mise à jour à partir de quatre tuiles complètes | 1,86 s | 188 ms |
+| Synchronisation par delta | 642 ms | 1 ms |
+| 20 mises à jour de progression | 12,83 s | < 1 ms |
+| 20 sélections de groupes de 5 000 pixels | 12,96 s | 71 ms |
+
+Dans la même simulation, l’analyse d’un modèle de 4 millions de pixels a pris 4,60 s, avec un intervalle maximal de 16 ms entre les passages de la boucle d’événements pendant l’analyse. La mémoire du cache augmente avec la surface du modèle. Un changement de modèle, de filtres ou de palette peut nécessiter une nouvelle sélection et un nouveau tri.
+
+Pour reproduire la comparaison dans PowerShell, enregistrez le script de la v1.1.12 puis exécutez le même scénario sur les deux fichiers.
+
+```powershell
+git show a995066:ghostpixel-bot-clean.user.js | Set-Content -Encoding UTF8 v1.1.12.user.js
+node tests/benchmark.cjs v1.1.12.user.js
+node tests/benchmark.cjs
+```
+
 ## Stockage et session
 
 Les réglages du panneau sont enregistrés dans le stockage local de GeoPixels. Les grands modèles utilisent IndexedDB lorsque l’espace disponible dans le stockage local est insuffisant. Le script utilise la session du site pour synchroniser, peindre et effectuer les achats.

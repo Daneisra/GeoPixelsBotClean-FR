@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GhostPixel Bot Clean
 // @namespace    https://github.com/Fox3225/GeoPixelsBotClean
-// @version      1.1.12
+// @version      1.1.13
 // @description  Script GeoPixels pour peindre des images fantômes, synchroniser la progression, recevoir une notification de fin, gérer les priorités de couleurs, acheter les couleurs manquantes et augmenter la capacité d’énergie.
 // @author       Fox3225 + Codex
 // @match        https://geopixels.net/*
@@ -22,10 +22,18 @@
 	"use strict";
 
 	const win = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
-	const VERSION = "1.1.12";
+	const VERSION = "1.1.13";
 	const ACCOUNT_MONITOR_URL = "http://127.0.0.1:47631/connect";
 	const TILE_SIZE = 1000;
 	const TILE_BATCH_SIZE = 9;
+	const WORK_CHUNK = 32768;
+	const BOARD_REFRESH_MS = 30000;
+	const UNKNOWN_COLOR = -2;
+	const PIXEL_UNKNOWN = 0;
+	const PIXEL_CORRECT = 1;
+	const PIXEL_WRONG = 2;
+	const PIXEL_EMPTY = 3;
+	const numberFormat = new Intl.NumberFormat("fr-FR");
 	const MAX_PIXELS_PER_REQUEST = 5000;
 	const REQUEST_PAUSE_MS = 1200;
 	const EMPTY_ENERGY_PAUSE_MIN_MS = 15000;
@@ -81,12 +89,13 @@
 		syncing: false,
 		stopRequested: false,
 		placedThisRun: 0,
-		totalTargets: 0,
+		paintedGroups: 0,
+		runStartedAt: 0,
+		runNumber: 0,
 		remaining: 0,
 		energy: null,
 		salvoPhase: "start",
 		nextBatchSize: 0,
-		serverTimestamp: 0,
 		status: "idle",
 		message: "Prêt",
 	};
@@ -94,6 +103,9 @@
 	let settings = loadSettings();
 	let stopWake = null;
 	let targetCache = null;
+	let purchaseTargetCache = null;
+	let modelCache = null;
+	let targetRevision = 0;
 	let purchaseObserverInstalled = false;
 	let originalFetch = null;
 	let authCache = null;
@@ -103,8 +115,6 @@
 	const autoPurchases = { balance: null, spent: 0, next: "", message: "", retryAt: 0 };
 	const purchaseEvents = [];
 	const purchasedColorIds = new Set();
-	const boardColors = new Map();
-	const tileTimestamps = new Map();
 	const ui = {};
 
 	function log(level, ...args) {
@@ -753,10 +763,6 @@
 		return "#" + (id & 0xffffff).toString(16).padStart(6, "0").toUpperCase();
 	}
 
-	function coordKey(x, y) {
-		return x + "," + y;
-	}
-
 	function tileKey(x, y) {
 		return tileOrigin(x) + "_" + tileOrigin(y);
 	}
@@ -1096,15 +1102,6 @@
 		};
 	}
 
-	function coordinateAllowedByAreas(x, y) {
-		const areas = settings.areas || [];
-		const inside = (area) => x >= area.x1 && x <= area.x2 && y >= area.y1 && y <= area.y2;
-		const inclusions = areas.filter((area) => area.mode === "include");
-		if (inclusions.length && !inclusions.some(inside)) return false;
-		if (areas.some((area) => area.mode === "exclude" && inside(area))) return false;
-		return true;
-	}
-
 	function describeAreaPurchaseScope() {
 		const areas = settings.areas || [];
 		const inclusions = areas.filter((area) => area.mode === "include");
@@ -1350,196 +1347,296 @@
 
 	function settingsSignature() {
 		return [
-			settings.includeFreeColors ? "free" : "paid",
-			settings.includeTransparent ? "alpha" : "opaque",
-			[...settings.ignoredColors].sort((a, b) => a - b).join("."),
-			[...settings.priorityColors].sort((a, b) => a - b).join("."),
-			settings.smartPriority ? "smart" : "simple",
-			settings.prioritizeIncorrectColors ? "wrong-first" : "normal-order",
-			(settings.areas || []).map((area) => [area.mode, area.x1, area.y1, area.x2, area.y2].join(",")).join(";"),
+			settings.includeFreeColors, settings.includeTransparent, settings.smartPriority,
+			settings.ignoredColors.join("."), settings.priorityColors.join("."),
+			settings.areas.map((area) => [area.mode, area.x1, area.y1, area.x2, area.y2].join(",")).join(";"),
 		].join("|");
 	}
 
-	function invalidateTargets(options = {}) {
+	function invalidateTargets() {
+		// Les filtres et la palette changent la sélection, les observations restent valables pour le même modèle.
+		targetRevision++;
 		targetCache = null;
-		boardColors.clear();
-		tileTimestamps.clear();
-		state.serverTimestamp = 0;
-		if (!options.preserveProgress) {
-			state.totalTargets = 0;
-			state.remaining = 0;
+		purchaseTargetCache = null;
+		state.remaining = 0;
+	}
+
+	function sameGhost(model, source) {
+		return model && source && model.imageData === source.imageData &&
+			model.gridX === source.gridX && model.gridY === source.gridY;
+	}
+
+	async function yieldWork() {
+		await delay(0);
+		if (state.stopRequested) throw new Error("Arrêté");
+	}
+
+	async function analyzeGhost(source) {
+		const { imageData, gridX, gridY } = source;
+		const { width, data } = imageData;
+		const height = data.length / (4 * width);
+		if (!Number.isSafeInteger(gridX) || !Number.isSafeInteger(gridY) ||
+			!Number.isInteger(width) || width < 1 || !Number.isInteger(height) || height < 1) {
+			throw new Error("Dimensions ou coordonnées du modèle invalides.");
+		}
+		const length = width * height;
+		const colors = new Int32Array(length);
+		const observed = new Int32Array(length);
+		for (let start = 0; start < length; start += WORK_CHUNK) {
+			const end = Math.min(start + WORK_CHUNK, length);
+			observed.fill(UNKNOWN_COLOR, start, end);
+			for (let index = start; index < end; index++) {
+				const offset = index * 4;
+				colors[index] = data[offset + 3] === 0 ? -1 :
+					(data[offset] << 16) | (data[offset + 1] << 8) | data[offset + 2];
+			}
+			if (end < length) await yieldWork();
+		}
+		const west = tileOrigin(gridX);
+		const north = tileOrigin(gridY);
+		const tiles = [];
+		const tilesByKey = new Map();
+		const columns = 1 + (tileOrigin(gridX + width - 1) - west) / TILE_SIZE;
+		for (let y = north; y >= tileOrigin(gridY - height + 1); y -= TILE_SIZE) {
+			for (let x = west; x <= tileOrigin(gridX + width - 1); x += TILE_SIZE) {
+				const left = Math.max(0, x - gridX);
+				const right = Math.min(width, x + TILE_SIZE - gridX);
+				const top = Math.max(0, gridY - (y + TILE_SIZE - 1));
+				const bottom = Math.min(height, gridY - y + 1);
+				const tile = { x, y, left, right, top, bottom, timestamp: 0, unknown: (right - left) * (bottom - top) };
+				tiles.push(tile);
+				tilesByKey.set(tileKey(x, y), tile);
+			}
+		}
+		return { ...source, width, height, colors, observed, tiles, tilesByKey, columns, west, north };
+	}
+
+	function modelTile(model, col, row) {
+		const x = Math.floor((model.gridX + col - model.west) / TILE_SIZE);
+		const y = -Math.floor((model.gridY - row - model.north) / TILE_SIZE);
+		return model.tiles[y * model.columns + x];
+	}
+
+	async function sortTargetKeys(indices, keys, scratch) {
+		// Chaque passage stable conserve l’ordre des critères déjà traités.
+		const first = keys[indices[0]];
+		let varying = 0;
+		for (let index = 1; index < indices.length; index++) {
+			varying |= first ^ keys[indices[index]];
+			if (index % WORK_CHUNK === 0) await yieldWork();
+		}
+		for (let shift = 0; shift < 32; shift += 8) {
+			if (!((varying >>> shift) & 255)) continue;
+			const offsets = new Uint32Array(256);
+			for (let index = 0; index < indices.length; index++) {
+				offsets[(keys[indices[index]] >>> shift) & 255]++;
+				if ((index + 1) % WORK_CHUNK === 0) await yieldWork();
+			}
+			let total = 0;
+			for (let bucket = 0; bucket < offsets.length; bucket++) {
+				const count = offsets[bucket];
+				offsets[bucket] = total;
+				total += count;
+			}
+			for (let index = 0; index < indices.length; index++) {
+				const pixel = indices[index];
+				scratch[offsets[(keys[pixel] >>> shift) & 255]++] = pixel;
+				if ((index + 1) % WORK_CHUNK === 0) await yieldWork();
+			}
+			[indices, scratch] = [scratch, indices];
+		}
+		return [indices, scratch];
+	}
+
+	async function measureRegions(model, indices, ranks) {
+		const { width, colors } = model;
+		const regions = new Uint32Array(colors.length);
+		const queue = new Uint32Array(indices.length);
+		let size = 0;
+		let work = 0;
+		let color = 0;
+		const add = (index) => {
+			if (ranks[index] && !regions[index] && colors[index] === color) {
+				regions[index] = 1;
+				queue[size++] = index;
+			}
+		};
+		for (let rank = 0; rank < indices.length; rank++) {
+			const root = indices[rank];
+			if (regions[root]) {
+				if (++work % WORK_CHUNK === 0) await yieldWork();
+				continue;
+			}
+			color = colors[root];
+			size = 0;
+			add(root);
+			for (let index = 0; index < size; index++) {
+				const pixel = queue[index];
+				const col = pixel % width;
+				if (col > 0) add(pixel - 1);
+				if (col + 1 < width) add(pixel + 1);
+				add(pixel - width);
+				add(pixel + width);
+				if (++work % WORK_CHUNK === 0) await yieldWork();
+			}
+			for (let index = 0; index < size; index++) {
+				regions[queue[index]] = size;
+				if (++work % WORK_CHUNK === 0) await yieldWork();
+			}
+		}
+		return regions;
+	}
+
+	function pixelStatus(expected, observed) {
+		if (observed === UNKNOWN_COLOR) return PIXEL_UNKNOWN;
+		if (observed === expected) return PIXEL_CORRECT;
+		return observed === -1 ? PIXEL_EMPTY : PIXEL_WRONG;
+	}
+
+	function countPixel(cache, rank, color, classification, change) {
+		cache.counts[classification] += change;
+		if (classification !== PIXEL_WRONG && classification !== PIXEL_EMPTY) return;
+		if (cache.missingByColor) {
+			const count = (cache.missingByColor.get(color) ?? 0) + change;
+			if (count) cache.missingByColor.set(color, count);
+			else cache.missingByColor.delete(color);
+			return;
+		}
+		const word = rank >>> 5;
+		const bit = 1 << (rank & 31);
+		if (change > 0) {
+			cache.pending[word] |= bit;
+			if (word < cache.firstPending) cache.firstPending = word;
+			if (classification === PIXEL_WRONG) {
+				cache.wrong[word] |= bit;
+				if (word < cache.firstWrong) cache.firstWrong = word;
+			}
+		} else {
+			cache.pending[word] &= ~bit;
+			cache.wrong[word] &= ~bit;
 		}
 	}
 
-	function buildTargets(options = {}) {
-		const includeUnowned = !!options.includeUnowned;
-		const onlyUnowned = !!options.onlyUnowned;
-		const skipOrdering = !!options.skipOrdering;
+	async function buildTargets(options = {}) {
 		const source = getGhostSource();
-		if (!source) {
-			throw new Error("Chargez et positionnez une image fantôme dans GeoPixels.");
+		if (!source) throw new Error("Chargez et positionnez une image fantôme dans GeoPixels.");
+		const revision = targetRevision;
+		if (!sameGhost(modelCache, source)) {
+			const model = await analyzeGhost(source);
+			if (revision !== targetRevision || !sameGhost(model, getGhostSource())) return buildTargets(options);
+			modelCache = model;
+			invalidateTargets();
+			return buildTargets(options);
 		}
 
-		const sourceKey = [
-			source.imageData.width,
-			source.imageData.height,
-			source.gridX,
-			source.gridY,
-			source.imageData.data.length,
-			settingsSignature(),
-			includeUnowned ? "all-colors" : "owned-colors",
-			onlyUnowned ? "only-unowned" : "all-eligible",
-			skipOrdering ? "source-order" : "priority-order",
-		].join(":");
-
-		if (!options.silent && targetCache && targetCache.sourceKey === sourceKey && targetCache.imageData === source.imageData) {
-			return targetCache;
-		}
-
-		const ignored = new Set(settings.ignoredColors);
-		const priority = new Set(settings.priorityColors);
+		const model = modelCache;
+		const filter = settings;
 		const owned = options.owned || getOwnedColorIds();
-		const targets = [];
-		const targetKeys = new Set();
-		const targetsByTile = new Map();
-		const data = source.imageData.data;
-		const width = source.imageData.width;
+		const key = settingsSignature() + "|" + (owned ? [...owned].sort((a, b) => a - b).join(",") : "?");
+		const existing = options.onlyUnowned ? purchaseTargetCache : targetCache;
+		if (existing?.model === model && existing.key === key) return existing;
 
-		for (let dataIndex = 0, pixelIndex = 0; dataIndex < data.length; dataIndex += 4, pixelIndex++) {
-			const x = source.gridX + (pixelIndex % width);
-			const y = source.gridY - Math.floor(pixelIndex / width);
-			if (!coordinateAllowedByAreas(x, y)) continue;
-
-			const colorId = rgbaToColorId(data[dataIndex], data[dataIndex + 1], data[dataIndex + 2], data[dataIndex + 3]);
-			const isTransparent = colorId === -1;
-			const isFree = FREE_COLOR_IDS.has(colorId);
-
-			if (!settings.includeTransparent && isTransparent) continue;
-			if (!settings.includeFreeColors && isFree) continue;
-			if (priority.size && !priority.has(colorId)) continue;
-			if (ignored.has(colorId)) continue;
-			if (!includeUnowned && owned && !isFree && !owned.has(colorId)) continue;
-			if (onlyUnowned && (isFree || (owned && owned.has(colorId)))) continue;
-			const key = coordKey(x, y);
-			const target = { x, y, key, colorId };
-			const tk = tileKey(x, y);
-
-			targets.push(target);
-			targetKeys.add(key);
-			if (!targetsByTile.has(tk)) targetsByTile.set(tk, []);
-			targetsByTile.get(tk).push(target);
+		const { colors, width, gridX, gridY } = model;
+		const ignored = new Set(filter.ignoredColors);
+		const priority = new Map(filter.priorityColors.map((id, rank) => [id, rank]));
+		const includes = filter.areas.filter((area) => area.mode === "include");
+		const excludes = filter.areas.filter((area) => area.mode === "exclude");
+		const inside = (area, x, y) => x >= area.x1 && x <= area.x2 && y >= area.y1 && y <= area.y2;
+		const ranks = new Uint32Array(colors.length);
+		const frequencies = new Map();
+		const activeTiles = new Set();
+		const unordered = new Uint32Array(colors.length);
+		let count = 0;
+		let index = 0;
+		for (let row = 0; row < model.height; row++) {
+			const y = gridY - row;
+			const tileRow = -Math.floor((y - model.north) / TILE_SIZE) * model.columns;
+			let tileColumn = 0;
+			let tile = model.tiles[tileRow];
+			let tileSelected = false;
+			for (let col = 0; col < width; col++, index++) {
+				if (index && index % WORK_CHUNK === 0) await yieldWork();
+				if (col === tile.right) {
+					tile = model.tiles[tileRow + ++tileColumn];
+					tileSelected = false;
+				}
+				const color = colors[index];
+				const free = FREE_COLOR_IDS.has(color);
+				if ((color === -1 && !filter.includeTransparent) || (free && !filter.includeFreeColors) ||
+					ignored.has(color) || (priority.size && !priority.has(color))) continue;
+				if (options.onlyUnowned ? free || owned.has(color) : owned && !free && !owned.has(color)) continue;
+				const x = gridX + col;
+				if ((includes.length && !includes.some((area) => inside(area, x, y))) ||
+					(excludes.length && excludes.some((area) => inside(area, x, y)))) continue;
+				if (!tileSelected) {
+					activeTiles.add(tile);
+					tileSelected = true;
+				}
+				unordered[count++] = index;
+				ranks[index] = 1;
+				if (!options.onlyUnowned) frequencies.set(color, (frequencies.get(color) ?? 0) + 1);
+			}
 		}
 
+		let indices = count === unordered.length ? unordered : unordered.slice(0, count);
+		if (!options.onlyUnowned && count > 1) {
+			// Départage par rareté, puis taille de région, puis priorité manuelle. Les égalités restent dans l’ordre du modèle.
+			let scratch = new Uint32Array(count);
+			const keys = new Uint32Array(colors.length);
+			if (frequencies.size > 1) {
+				for (let index = 0; index < count; index++) {
+					const pixel = indices[index];
+					keys[pixel] = frequencies.get(colors[pixel]);
+					if ((index + 1) % WORK_CHUNK === 0) await yieldWork();
+				}
+				[indices, scratch] = await sortTargetKeys(indices, keys, scratch);
+			}
+			if (filter.smartPriority) {
+				const regions = await measureRegions(model, indices, ranks);
+				[indices, scratch] = await sortTargetKeys(indices, regions, scratch);
+			}
+			if (priority.size > 1) {
+				for (let index = 0; index < count; index++) {
+					const pixel = indices[index];
+					keys[pixel] = priority.get(colors[pixel]);
+					if ((index + 1) % WORK_CHUNK === 0) await yieldWork();
+				}
+				[indices] = await sortTargetKeys(indices, keys, scratch);
+			}
+		}
+
+		const words = Math.ceil(count / 32);
+		// Un bit par rang représente un pixel observé à peindre. Les compteurs n’ont pas besoin de parcourir ces listes.
 		const cache = {
-			sourceKey,
-			imageData: source.imageData,
-			targets: skipOrdering ? targets : orderTargets(targets),
-			targetKeys,
-			targetsByTile,
-			tileKeys: [...targetsByTile.keys()],
+			model, key, indices, ranks: count ? ranks : new Uint32Array(0),
+			tiles: [...activeTiles], counts: [0, 0, 0, 0],
+			pending: new Uint32Array(options.onlyUnowned ? 0 : words),
+			wrong: new Uint32Array(options.onlyUnowned ? 0 : words),
+			firstPending: words, firstWrong: words,
+			missingByColor: options.onlyUnowned ? new Map() : null,
 		};
-		if (!options.silent) {
-			targetCache = cache;
-			state.totalTargets = cache.targets.length;
+		for (let rank = 0; rank < count; rank++) {
+			const index = indices[rank];
+			ranks[index] = rank + 1;
+			countPixel(cache, rank, colors[index], pixelStatus(colors[index], model.observed[index]), 1);
+			if ((rank + 1) % WORK_CHUNK === 0) await yieldWork();
 		}
+		if (revision !== targetRevision || !sameGhost(model, getGhostSource())) return buildTargets(options);
+		if (options.onlyUnowned) purchaseTargetCache = cache;
+		else targetCache = cache;
 		return cache;
-	}
-
-	function orderTargets(targets) {
-		const colorCounts = new Map();
-		for (const target of targets) {
-			colorCounts.set(target.colorId, (colorCounts.get(target.colorId) || 0) + 1);
-		}
-
-		const priorityRank = new Map(settings.priorityColors.map((id, index) => [id, index]));
-		if (settings.smartPriority) annotateRegionSizes(targets);
-
-		return [...targets].sort((a, b) => {
-			const priorityA = priorityRank.has(a.colorId) ? priorityRank.get(a.colorId) : Number.MAX_SAFE_INTEGER;
-			const priorityB = priorityRank.has(b.colorId) ? priorityRank.get(b.colorId) : Number.MAX_SAFE_INTEGER;
-			if (priorityA !== priorityB) return priorityA - priorityB;
-
-			if (settings.smartPriority) {
-				const regionA = Number.isFinite(a.regionSize) ? a.regionSize : Number.MAX_SAFE_INTEGER;
-				const regionB = Number.isFinite(b.regionSize) ? b.regionSize : Number.MAX_SAFE_INTEGER;
-				if (regionA !== regionB) return regionA - regionB;
-			}
-
-			const byRarity = colorCounts.get(a.colorId) - colorCounts.get(b.colorId);
-			if (byRarity !== 0) return byRarity;
-			if (a.y !== b.y) return b.y - a.y;
-			return a.x - b.x;
-		});
-	}
-
-	function annotateRegionSizes(targets) {
-		const targetByKey = new Map();
-		for (const target of targets) targetByKey.set(target.key, target);
-
-		const visited = new Set();
-		const stack = [];
-		const pushNeighbor = (key, colorId) => {
-			if (visited.has(key)) return;
-			const next = targetByKey.get(key);
-			if (!next || next.colorId !== colorId) return;
-			visited.add(key);
-			stack.push(next);
-		};
-
-		for (const target of targets) {
-			if (visited.has(target.key)) continue;
-
-			const region = [];
-			const colorId = target.colorId;
-			visited.add(target.key);
-			stack.push(target);
-
-			while (stack.length) {
-				const current = stack.pop();
-				region.push(current);
-
-				pushNeighbor(coordKey(current.x + 1, current.y), colorId);
-				pushNeighbor(coordKey(current.x - 1, current.y), colorId);
-				pushNeighbor(coordKey(current.x, current.y + 1), colorId);
-				pushNeighbor(coordKey(current.x, current.y - 1), colorId);
-			}
-
-			const size = region.length;
-			for (const item of region) item.regionSize = size;
-		}
 	}
 
 	async function getMissingRequiredColors(owned = getOwnedColorIds()) {
 		if (!owned) throw new Error("GeoPixels charge encore la liste des couleurs achetées.");
-
-		// Seuls les pixels aux couleurs payantes non acquises comptent pour l’achat.
-		// Ignorer le tri des priorités accélère la vérification des grands modèles.
-		const purchaseOptions = {
-			includeUnowned: true,
-			onlyUnowned: true,
-			skipOrdering: true,
-			silent: true,
-			owned,
-			colors: new Map(),
-			timestamps: new Map(),
-		};
-		const cache = buildTargets(purchaseOptions);
-		await syncBoard(purchaseOptions, cache);
-		let unsyncedCount = 0;
-		const pendingColors = new Set();
-		for (const target of cache.targets) {
-			if (!purchaseOptions.colors.has(target.key)) {
-				unsyncedCount++;
-				continue;
-			}
-			if (purchaseOptions.colors.get(target.key) !== target.colorId) pendingColors.add(target.colorId);
-		}
-		if (state.stopRequested) return [];
-		if (unsyncedCount) {
-			throw new Error("Impossible de vérifier " + unsyncedCount + " pixel(s) sur la carte.");
-		}
-		return [...pendingColors].sort((a, b) => a - b);
+		const options = { onlyUnowned: true, silent: true, owned };
+		const cache = await buildTargets(options);
+		await syncBoard(options, cache);
+		const unknown = cache.counts[PIXEL_UNKNOWN];
+		if (unknown) throw new Error("Impossible de vérifier " + numberFormat.format(unknown) + " pixel(s) sur la carte.");
+		return [...cache.missingByColor.keys()].sort((a, b) => a - b);
 	}
+
 
 	function automaticPurchaseLedgerKey(accountId) {
 		return SETTINGS_KEY + "_purchases_" + accountId;
@@ -1940,20 +2037,20 @@
 			const result = await buyColor(colorId);
 			if (result === "insufficient") {
 				setStatus("waiting", "Solde de pixels insuffisant. Couleurs achetées : " + bought + "/" + purchaseBatch.length + ".");
-				invalidateTargets({ preserveProgress: true });
+				invalidateTargets();
 				return { bought, total: purchaseBatch.length, remaining: missing.length - bought, insufficient: true };
 			}
 			if (result !== true) {
 				const remaining = missing.length - bought;
 				setStatus("error", "Achat interrompu après un échec. Couleurs restantes : " + remaining + ".");
-				invalidateTargets({ preserveProgress: true });
+				invalidateTargets();
 				return { bought, total: purchaseBatch.length, remaining, failed: true, insufficient: false };
 			}
 			bought++;
 			await delay(COLOR_PURCHASE_PAUSE_MS);
 		}
 
-		invalidateTargets({ preserveProgress: true });
+		invalidateTargets();
 		const remaining = missing.length - bought;
 		setStatus(
 			"idle",
@@ -1975,6 +2072,9 @@
 
 	async function webpToImageData(base64) {
 		const img = await loadImage("data:image/webp;base64," + base64);
+		if (img.naturalWidth !== TILE_SIZE || img.naturalHeight !== TILE_SIZE) {
+			throw new Error("Dimensions de tuile GeoPixels invalides.");
+		}
 		const canvas = document.createElement("canvas");
 		canvas.width = TILE_SIZE;
 		canvas.height = TILE_SIZE;
@@ -1985,91 +2085,146 @@
 		return ctx.getImageData(0, 0, TILE_SIZE, TILE_SIZE);
 	}
 
-	function readFullTilePixels(tileX, tileY, imageData, targets, colors) {
-		const data = imageData.data;
-		const topY = tileY + TILE_SIZE - 1;
-
-		for (const target of targets) {
-			const col = target.x - tileX;
-			const row = topY - target.y;
-			if (col < 0 || col >= TILE_SIZE || row < 0 || row >= TILE_SIZE) continue;
-
-			const index = ((row * TILE_SIZE) + col) * 4;
-			colors.set(
-				target.key,
-				rgbaToColorId(data[index], data[index + 1], data[index + 2], data[index + 3])
-			);
+	function recordObservation(model, tile, index, color) {
+		const previous = model.observed[index];
+		if (previous === color) return;
+		model.observed[index] = color;
+		tile.unknown += (color === UNKNOWN_COLOR ? 1 : 0) - (previous === UNKNOWN_COLOR ? 1 : 0);
+		const expected = model.colors[index];
+		const oldStatus = pixelStatus(expected, previous);
+		const newStatus = pixelStatus(expected, color);
+		if (oldStatus === newStatus) return;
+		if (targetCache?.model === model && targetCache.ranks[index]) {
+			const rank = targetCache.ranks[index] - 1;
+			countPixel(targetCache, rank, expected, oldStatus, -1);
+			countPixel(targetCache, rank, expected, newStatus, 1);
+		}
+		if (purchaseTargetCache?.model === model && purchaseTargetCache.ranks[index]) {
+			const rank = purchaseTargetCache.ranks[index] - 1;
+			countPixel(purchaseTargetCache, rank, expected, oldStatus, -1);
+			countPixel(purchaseTargetCache, rank, expected, newStatus, 1);
 		}
 	}
 
-	async function fetchTiles(tileCoords, timestamps) {
+	async function readFullTilePixels(model, tile, imageData) {
+		const { data } = imageData;
+		if (data.length !== TILE_SIZE * TILE_SIZE * 4) throw new Error("Dimensions de tuile GeoPixels invalides.");
+		const { left, right, top, bottom } = tile;
+		let budget = WORK_CHUNK;
+		for (let row = top; row < bottom; row++) {
+			let index = row * model.width + left;
+			let offset = ((tile.y + TILE_SIZE - 1 - model.gridY + row) * TILE_SIZE +
+				model.gridX + left - tile.x) * 4;
+			for (let col = left; col < right; col++, index++, offset += 4) {
+				recordObservation(model, tile, index, data[offset + 3] === 0 ? -1 :
+					(data[offset] << 16) | (data[offset + 1] << 8) | data[offset + 2]);
+			}
+			budget -= right - left;
+			if (budget <= 0) {
+				budget = WORK_CHUNK;
+				await yieldWork();
+			}
+		}
+	}
+
+	async function fetchTiles(tiles) {
 		const response = await fetch("/GetPixelsCached", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			signal: AbortSignal.timeout(PAINT_REQUEST_TIMEOUT_MS),
 			body: JSON.stringify({
-				Tiles: tileCoords.map((tile) => ({
-					x: tile.x,
-					y: tile.y,
-					timestamp: timestamps.get(tileKey(tile.x, tile.y)) || 0,
-				})),
+				Tiles: tiles.map(({ x, y, timestamp, unknown }) => ({ x, y, timestamp: unknown ? 0 : timestamp })),
 			}),
 		});
-
-		if (!response.ok) {
-			throw new Error("Échec du chargement des tuiles (HTTP " + response.status + ").");
-		}
+		if (!response.ok) throw new Error("Échec du chargement des tuiles (HTTP " + response.status + ").");
 		return response.json();
 	}
 
-	async function syncBoard(options = {}, cache = buildTargets(options)) {
-		if (!cache.tileKeys.length) return;
+	async function syncBoard(options = {}, cache) {
+		cache ??= await buildTargets(options);
+		const { model, tiles } = cache;
+		if (tiles.length && !options.silent) setStatus("syncing", "Synchronisation de " + tiles.length + " tuile(s)…");
+		for (const group of chunk(tiles, TILE_BATCH_SIZE)) {
+			if (state.stopRequested) return cache;
+			const payload = await fetchTiles(group);
+			const timestamp = Number(payload?.ServerTimestamp);
+			const requested = new Set(group);
+			for (const [responseKey, response] of Object.entries(payload?.Tiles || {})) {
+				const { x, y } = parseTileKey(responseKey);
+				const tile = model.tilesByKey.get(tileKey(x, y));
+				if (!tile || !requested.has(tile) || x !== tile.x || y !== tile.y ||
+					(Number.isFinite(timestamp) && timestamp < tile.timestamp)) continue;
 
-		const { colors = boardColors, timestamps = tileTimestamps } = options;
-		if (!options.silent) setStatus("syncing", "Synchronisation de " + cache.tileKeys.length + " tuile(s)…");
-		for (const group of chunk(cache.tileKeys.map(parseTileKey), TILE_BATCH_SIZE)) {
-			if (state.stopRequested) return;
-
-			const payload = await fetchTiles(group, timestamps);
-			if (!options.silent && payload?.ServerTimestamp) state.serverTimestamp = payload.ServerTimestamp;
-			const timestamp = payload && Number(payload.ServerTimestamp);
-
-			for (const [responseKey, tile] of Object.entries((payload && payload.Tiles) || {})) {
-				const { x: tileX, y: tileY } = parseTileKey(responseKey);
-				if (!Number.isFinite(tileX) || !Number.isFinite(tileY)) continue;
-				if (Number.isFinite(timestamp)) timestamps.set(tileKey(tileX, tileY), timestamp);
-				const targetGroup = cache.targetsByTile.get(tileKey(tileX, tileY));
-				if (!targetGroup || !tile) continue;
-
-				if (tile.Type === "delta" && Array.isArray(tile.Pixels)) {
-					for (const pixel of tile.Pixels) {
-						const [x, y, color] = pixel;
-						const key = coordKey(x, y);
-						if (cache.targetKeys.has(key)) colors.set(key, toColorId(color));
+				if (response?.Type === "delta" && Array.isArray(response.Pixels)) {
+					for (let i = 0; i < response.Pixels.length; i++) {
+						if (i && i % WORK_CHUNK === 0) await yieldWork();
+						const pixel = response.Pixels[i];
+						if (!Array.isArray(pixel)) continue;
+						const [gridX, gridY, rawColor] = pixel;
+						if (![gridX, gridY].every((coordinate) => typeof coordinate === "number" ||
+							(typeof coordinate === "string" && /^-?\d+$/.test(coordinate)))) continue;
+						const col = Number(gridX) - model.gridX;
+						const row = model.gridY - Number(gridY);
+						if (!Number.isInteger(col) || !Number.isInteger(row) || col < tile.left || col >= tile.right ||
+							row < tile.top || row >= tile.bottom) continue;
+						if (typeof rawColor === "number" && !Number.isInteger(rawColor)) continue;
+						const color = toColorId(rawColor);
+						if (color === null || color < -1 || color > 0xFFFFFF) continue;
+						recordObservation(model, tile, row * model.width + col, color);
 					}
-				} else if (tile.Type === "full" && tile.ColorWebP) {
-					const imageData = await webpToImageData(tile.ColorWebP);
-					readFullTilePixels(tileX, tileY, imageData, targetGroup, colors);
+				} else if (response?.Type === "full" && response.ColorWebP) {
+					await readFullTilePixels(model, tile, await webpToImageData(response.ColorWebP));
+				} else {
+					continue;
 				}
+				if (Number.isFinite(timestamp) && timestamp > 0) tile.timestamp = timestamp;
 			}
 		}
 		if (!options.silent) updateProgress();
+		return cache;
 	}
 
-	function getRemainingTargets(options = {}) {
-		const cache = buildTargets(options);
-		const remaining = cache.targets.filter((target) => boardColors.get(target.key) !== target.colorId);
-		if (!settings.prioritizeIncorrectColors || options.skipOrdering) return remaining;
-
-		return remaining
-			.map((target, index) => ({
-				target,
-				index,
-				incorrect: boardColors.has(target.key) && boardColors.get(target.key) !== -1,
-			}))
-			.sort((a, b) => Number(b.incorrect) - Number(a.incorrect) || a.index - b.index)
-			.map((item) => item.target);
+	function selectNextTargets(cache, size) {
+		const batch = [];
+		const { model, indices } = cache;
+		const sent = model.runNumber === state.runNumber ? model.sent : null;
+		const select = (mask, first, excluded) => {
+			while (cache[first] < mask.length && !mask[cache[first]]) cache[first]++;
+			for (let word = cache[first]; word < mask.length && batch.length < size; word++) {
+				let bits = excluded ? mask[word] & ~excluded[word] : mask[word];
+				while (bits && batch.length < size) {
+					const rank = word * 32 + 31 - Math.clz32(bits & -bits);
+					bits &= bits - 1;
+					const index = indices[rank];
+					if (sent?.[index]) continue;
+					batch.push({
+						index,
+						x: model.gridX + index % model.width,
+						y: model.gridY - Math.floor(index / model.width),
+						colorId: model.colors[index],
+					});
+				}
+			}
+		};
+		if (settings.prioritizeIncorrectColors) select(cache.wrong, "firstWrong");
+		select(cache.pending, "firstPending", settings.prioritizeIncorrectColors ? cache.wrong : null);
+		return batch;
 	}
+
+	function recordPixelBatch(cache, batch, confirmed) {
+		const { model } = cache;
+		if (confirmed && model.runNumber !== state.runNumber) {
+			model.runNumber = state.runNumber;
+			model.sent = new Uint8Array(model.colors.length);
+		}
+		for (const target of batch) {
+			const tile = modelTile(model, target.x - model.gridX, model.gridY - target.y);
+			if (confirmed) model.sent[target.index] = 1;
+			else tile.timestamp = 0; // Une réponse indéterminée exige une nouvelle lecture de la tuile.
+			recordObservation(model, tile, target.index, confirmed ? target.colorId : UNKNOWN_COLOR);
+		}
+	}
+
 
 	function readEnergy() {
 		if (state.energy) return state.energy;
@@ -2107,22 +2262,22 @@
 
 	function formatDuration(seconds) {
 		seconds = Math.max(0, Math.round(seconds));
-		const h = Math.floor(seconds / 3600);
+		const days = Math.floor(seconds / 86400);
+		const h = Math.floor((seconds % 86400) / 3600);
 		const m = Math.floor((seconds % 3600) / 60);
 		const s = seconds % 60;
+		if (days > 0) return numberFormat.format(days) + " j " + h + " h";
 		if (h > 0) return h + " h " + m + " min";
 		if (m > 0) return m + " min " + s + " s";
 		return s + " s";
 	}
 
-	function estimateEta(remaining) {
-		const { current, rate } = readEnergy();
-		if (current === null || !(rate > 0)) return "—";
-		const available = Math.max(0, current - settings.energyReserve);
-		return formatDuration(Math.max(0, remaining - available) * rate);
+	function observedPaintRate() {
+		const elapsed = (Date.now() - state.runStartedAt) / 1000;
+		return state.running && state.paintedGroups >= 2 && elapsed >= 2 ? state.placedThisRun / elapsed : 0;
 	}
 
-	async function sendPixelBatch(targets) {
+	async function sendPixelBatch(targets, cache) {
 		const pixels = targets
 			.map((target) => ({
 				GridX: Number(target.x),
@@ -2140,7 +2295,7 @@
 		}
 
 		installPageBridge();
-		if (state.stopRequested) return null;
+		if (state.stopRequested || targetCache !== cache || !sameGhost(cache.model, getGhostSource())) return null;
 		if (typeof win.__gpcPlacePixels === "function") {
 			try {
 				const result = normalizeEndpointResult(await win.__gpcPlacePixels(pixels));
@@ -2152,7 +2307,7 @@
 		}
 
 		const auth = await withTimeout(getAuthPayloadAsync(), PAINT_REQUEST_TIMEOUT_MS, "Délai de connexion à GeoPixels dépassé.");
-		if (state.stopRequested) return null;
+		if (state.stopRequested || targetCache !== cache || !sameGhost(cache.model, getGhostSource())) return null;
 		if (!auth.token || !auth.subject || !Number.isFinite(auth.userId)) {
 			return { ok: false, status: 401, text: "Session GeoPixels incomplète. Reconnectez-vous." };
 		}
@@ -2216,6 +2371,9 @@
 		state.running = true;
 		state.stopRequested = false;
 		state.placedThisRun = 0;
+		state.paintedGroups = 0;
+		state.runStartedAt = Date.now();
+		state.runNumber++;
 		state.salvoPhase = "start";
 		state.nextBatchSize = 0;
 		const salvos = settings.energyMode === "salvos";
@@ -2229,26 +2387,31 @@
 
 		try {
 			setStatus("running", "Préparation de l’image…");
-			invalidateTargets();
-			await syncBoard();
+			let syncedCache = await syncBoard();
+			let lastSyncAt = Date.now();
 
 			while (!state.stopRequested) {
-				const remainingTargets = getRemainingTargets();
-				state.remaining = remainingTargets.length;
-				if (remainingTargets.length > 0) hadPendingTargets = true;
+				const cache = await buildTargets();
+				if (cache !== syncedCache || Date.now() - lastSyncAt >= BOARD_REFRESH_MS) {
+					syncedCache = await syncBoard({}, cache);
+					lastSyncAt = Date.now();
+					refreshBoardBeforeSend = false;
+				}
+				if (state.stopRequested) break;
 				updateProgress();
+				if (state.remaining > 0) hadPendingTargets = true;
 
-				const automatic = await runAutomaticPurchases(remainingTargets.length > 0);
+				const automatic = await runAutomaticPurchases(cache.counts[PIXEL_WRONG] + cache.counts[PIXEL_EMPTY] > 0);
 				if (state.stopRequested) break;
 				if (automatic?.colorsChanged) {
 					await wait(COLOR_PURCHASE_PAUSE_MS);
 					if (state.stopRequested) break;
-					refreshBoardBeforeSend = false;
 					invalidateTargets();
-					await syncBoard();
 					continue;
 				}
-				if (!remainingTargets.length) {
+				if (targetCache !== cache || !sameGhost(cache.model, getGhostSource())) continue;
+				if (automatic) updateProgress();
+				if (!state.remaining) {
 					if (automatic?.colorsOutstanding) {
 						setStatus("waiting", "En attente du déblocage des couleurs du dessin.");
 						await wait(EMPTY_ENERGY_PAUSE_MIN_MS);
@@ -2257,6 +2420,10 @@
 					setStatus("done", automaticColors ? "Aucun pixel accessible à peindre dans la sélection."
 						: "Tous les pixels sélectionnés sont déjà corrects.");
 					notifyCompletion();
+					break;
+				}
+				if (!cache.counts[PIXEL_WRONG] && !cache.counts[PIXEL_EMPTY]) {
+					setStatus("waiting", "Des pixels restent non observés. Relancez la synchronisation pour les vérifier.");
 					break;
 				}
 
@@ -2308,23 +2475,28 @@
 				}
 				if (refreshBoardBeforeSend) {
 					refreshBoardBeforeSend = false;
-					await syncBoard();
+					syncedCache = await syncBoard({}, cache);
+					lastSyncAt = Date.now();
 					continue;
 				}
 				if (waitingForSalvo) {
 					state.salvoPhase = "active";
 					salvoRemaining = available;
 				}
-				const amount = Math.min(available, salvos ? salvoRemaining : available, remainingTargets.length, limit);
-				const batch = remainingTargets.slice(0, amount);
+				const batch = selectNextTargets(cache, Math.min(available, salvos ? salvoRemaining : available, limit));
+				const amount = batch.length;
+				if (!amount) {
+					setStatus("waiting", "Des pixels déjà envoyés ont changé. Redémarrez pour les corriger.");
+					break;
+				}
 				state.nextBatchSize = amount;
 				updateEnergyDisplay();
 				setStatus("running", "Envoi de " + amount + " pixel(s)…");
 
-				const result = await sendPixelBatch(batch);
-				if (!result) break;
+				const result = await sendPixelBatch(batch, cache);
+				if (!result) continue;
 				state.nextBatchSize = 0;
-				if (!result.ok) {
+				if (!result.ok || result.text !== "Ok") {
 					log("warn", "Échec de l’envoi des pixels", result.status, result.text);
 					if (result.status === 403 && /not enough energy/i.test(result.text || "")) {
 						state.energy = { ...energy, current: null };
@@ -2347,7 +2519,8 @@
 							continue;
 						}
 					}
-					const uncertain = result.requestUncertain || result.status === 0 || result.status === 408 || result.status >= 500;
+					const uncertain = result.ok || result.requestUncertain || result.status === 0 || result.status === 408 || result.status >= 500;
+					if (uncertain) recordPixelBatch(cache, batch, false);
 					setStatus("error", uncertain
 						? "Résultat de l’envoi incertain. La peinture est arrêtée. Redémarrez pour resynchroniser la carte."
 						: result.status === 413
@@ -2356,8 +2529,9 @@
 					break;
 				}
 
-				for (const target of batch) boardColors.set(target.key, target.colorId);
+				recordPixelBatch(cache, batch, true);
 				state.placedThisRun += amount;
+				state.paintedGroups++;
 				state.energy = { ...energy, current: energy.current - amount };
 				if (salvos) {
 					salvoRemaining -= amount;
@@ -2365,10 +2539,15 @@
 				}
 				if (!salvos || state.salvoPhase === "active") {
 					const usable = available - amount;
-					state.nextBatchSize = Math.min(usable, salvos ? salvoRemaining : usable, remainingTargets.length - amount, limit);
+					const pending = cache.counts[PIXEL_WRONG] + cache.counts[PIXEL_EMPTY];
+					state.nextBatchSize = Math.min(usable, salvos ? salvoRemaining : usable, pending, limit);
 				}
 				updateProgress();
 
+				if (targetCache !== cache || !sameGhost(cache.model, getGhostSource())) {
+					await wait(REQUEST_PAUSE_MS);
+					continue;
+				}
 				if (state.remaining === 0 && !automaticColors) {
 					setStatus("done", "Tous les pixels sélectionnés ont été envoyés.");
 					notifyCompletion();
@@ -2376,23 +2555,24 @@
 				}
 
 				await wait(REQUEST_PAUSE_MS);
-				if (state.stopRequested) break;
-				await syncBoard();
 			}
 
 			if (state.stopRequested && state.status !== "error") setStatus("stopped", "Arrêté");
 		} catch (error) {
-			log("error", error);
-			setStatus("error", error instanceof TypeError
-				? "La peinture a été interrompue. Vérifiez votre connexion à GeoPixels."
-				: error?.message || "La peinture a été interrompue.");
+			if (state.stopRequested) setStatus("stopped", "Arrêté");
+			else {
+				log("error", error);
+				setStatus("error", error instanceof TypeError
+					? "La peinture a été interrompue. Vérifiez votre connexion à GeoPixels."
+					: error?.message || "La peinture a été interrompue.");
+			}
 		} finally {
 			state.running = false;
 			state.stopRequested = false;
 			state.salvoPhase = "start";
 			state.nextBatchSize = 0;
 			setButtons();
-			updateEnergyDisplay();
+			updateProgress();
 		}
 	}
 
@@ -2401,15 +2581,12 @@
 		state.syncing = true;
 		setButtons();
 		try {
-			invalidateTargets();
 			await syncBoard();
 			const reading = await fetchEnergySnapshot();
 			if (reading.energy) state.energy = reading.energy;
 			const balance = automaticBalance(reading.data);
 			autoPurchases.balance = balance === null ? null : Math.floor(balance / 5);
 			renderAutomaticPurchases();
-			const remainingTargets = getRemainingTargets();
-			state.remaining = remainingTargets.length;
 			setStatus("idle", "Synchronisation terminée");
 			updateProgress();
 		} catch (error) {
@@ -2484,7 +2661,7 @@
 				saveSettings();
 				syncControls();
 				updateEnergyDisplay();
-				if (ui.etaText) ui.etaText.textContent = state.remaining ? estimateEta(state.remaining) : "—";
+				updateProgress();
 			});
 		}
 		syncControls();
@@ -2586,17 +2763,23 @@
 	}
 
 	function updateProgress() {
-		const total = state.totalTargets || (targetCache ? targetCache.targets.length : 0);
-		const remaining = targetCache ? getRemainingTargets().length : state.remaining;
-		const done = Math.max(0, total - remaining);
-		const percent = total > 0 ? Math.round((done / total) * 100) : 0;
+		const total = targetCache?.indices.length ?? 0;
+		const [unknown, done, wrong, empty] = targetCache?.counts ?? [0, 0, 0, 0];
+		const remaining = total - done;
+		const percent = total > 0 ? Math.floor((done / total) * 100) : 0;
 		state.remaining = remaining;
 
 		if (ui.bar) ui.bar.style.width = percent + "%";
-		if (ui.countText) ui.countText.textContent = done + " / " + total;
-		if (ui.remainingText) ui.remainingText.textContent = String(remaining);
+		if (ui.progress) ui.progress.setAttribute("aria-valuenow", String(percent));
+		if (ui.countText) ui.countText.textContent = numberFormat.format(done) + " / " + numberFormat.format(total);
+		if (ui.remainingText) ui.remainingText.textContent = numberFormat.format(remaining);
+		if (ui.wrongText) ui.wrongText.textContent = numberFormat.format(wrong);
+		if (ui.unknownText) ui.unknownText.textContent = numberFormat.format(unknown);
+		if (ui.emptyText) ui.emptyText.textContent = numberFormat.format(empty);
 		updateEnergyDisplay();
-		if (ui.etaText) ui.etaText.textContent = remaining ? estimateEta(remaining) : "-";
+		const rate = observedPaintRate();
+		if (ui.etaText) ui.etaText.textContent = rate && remaining && !unknown ? formatDuration(remaining / rate) : "—";
+		if (ui.rateText) ui.rateText.textContent = rate ? numberFormat.format(rate * 60) + " px/min" : "—";
 	}
 
 	function renderIgnoredColors() {
@@ -2706,8 +2889,9 @@
 				z-index: 2147483647;
 				top: 18px;
 				right: 18px;
-				width: min(292px, calc(100vw - 16px));
+				width: min(324px, calc(100vw - 16px));
 				color: #e5e7eb;
+				color-scheme: dark;
 				background: #111827;
 				border: 1px solid #374151;
 				border-radius: 8px;
@@ -2717,6 +2901,7 @@
 				display: flex;
 				flex-direction: column;
 				max-height: calc(100vh - 16px);
+				max-height: calc(100dvh - var(--gpc-top, 8px) - 8px);
 			}
 			#gpc-panel * { box-sizing: border-box; }
 			#gpc-head {
@@ -2763,8 +2948,10 @@
 				cursor: pointer;
 				flex: 0 0 auto;
 			}
-			#gpc-body { padding: 11px; overflow-y: auto; }
-			#gpc-panel.gpc-min #gpc-body { display: none; }
+			#gpc-body { min-height: 0; padding: 0 11px 11px; overflow-y: auto; overscroll-behavior: contain; }
+			#gpc-toolbar { flex: 0 0 auto; padding: 8px 11px; border-bottom: 1px solid #253044; }
+			#gpc-toolbar .gpc-row { flex-wrap: wrap; }
+			#gpc-panel.gpc-min #gpc-toolbar, #gpc-panel.gpc-min #gpc-body { display: none; }
 			#gpc-panel.gpc-min { width: min(206px, calc(100vw - 16px)); }
 			.gpc-row { display: flex; gap: 7px; align-items: center; }
 			#gpc-head > .gpc-row { flex: 0 0 auto; }
@@ -2806,7 +2993,7 @@
 			}
 			.gpc-stats {
 				display: grid;
-				grid-template-columns: repeat(4, 1fr);
+				grid-template-columns: repeat(2, minmax(0, 1fr));
 				gap: 6px;
 				margin: 9px 0 10px;
 			}
@@ -2828,14 +3015,20 @@
 				margin-top: 2px;
 				font-size: 12px;
 				font-weight: 700;
-				overflow: hidden;
-				text-overflow: ellipsis;
+				font-variant-numeric: tabular-nums;
+				overflow-wrap: anywhere;
 			}
+			.gpc-stat-total { grid-column: 1 / -1; }
+			.gpc-stat-total span { font-size: 15px; }
+			.gpc-pixel-summary { display: flex; flex-wrap: wrap; gap: 3px 10px; margin: 0 0 8px; }
 			.gpc-section {
 				margin-top: 10px;
 				padding-top: 10px;
 				border-top: 1px solid #273449;
 			}
+			details.gpc-section > summary { cursor: pointer; font-weight: 700; }
+			details.gpc-section[open] > summary { margin-bottom: 7px; }
+			details.gpc-section .gpc-btn { min-height: 30px; height: auto; white-space: normal; padding: 4px 9px; }
 			#gpc-energy-controls, #gpc-auto-controls { min-width: 0; padding: 0; margin: 7px 0 0; border: 0; }
 			.gpc-energy-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
 			.gpc-energy-grid label { min-width: 0; display: grid; gap: 3px; }
@@ -2939,22 +3132,27 @@
 					<button id="gpc-min" type="button" title="Réduire">-</button>
 				</div>
 			</div>
-			<div id="gpc-body">
+			<div id="gpc-toolbar">
 				<div class="gpc-row">
 					<button id="gpc-start" class="gpc-btn gpc-primary gpc-grow" type="button">Démarrer</button>
 					<button id="gpc-stop" class="gpc-btn gpc-danger gpc-grow" type="button">Arrêter</button>
 					<button id="gpc-sync" class="gpc-btn" type="button">Synchroniser</button>
 				</div>
-				<div class="gpc-row">
-					<button id="gpc-connect-monitor" class="gpc-btn gpc-grow" type="button">Connecter le moniteur</button>
-				</div>
-				<div id="gpc-message">Prêt</div>
-				<div id="gpc-progress"><div id="gpc-bar"></div></div>
+			</div>
+			<div id="gpc-body">
+				<div id="gpc-message" role="status">Prêt</div>
+				<div id="gpc-progress" role="progressbar" aria-label="Pixels confirmés" aria-valuenow="0"><div id="gpc-bar"></div></div>
 				<div class="gpc-stats">
-					<div class="gpc-stat"><b>Peints</b><span id="gpc-count">0 / 0</span></div>
+					<div class="gpc-stat gpc-stat-total"><b>Confirmés / sélectionnés</b><span id="gpc-count">0 / 0</span></div>
 					<div class="gpc-stat"><b>Restants</b><span id="gpc-left">0</span></div>
 					<div class="gpc-stat"><b>Énergie</b><span id="gpc-energy">— / —</span></div>
-					<div class="gpc-stat"><b>Temps estimé</b><span id="gpc-eta">-</span></div>
+					<div class="gpc-stat"><b>Temps estimé</b><span id="gpc-eta">—</span></div>
+					<div class="gpc-stat"><b>Débit observé</b><span id="gpc-rate">—</span></div>
+				</div>
+				<div class="gpc-pixel-summary gpc-muted">
+					<span>Incorrects <b id="gpc-wrong-count">0</b></span>
+					<span>Vides <b id="gpc-empty-count">0</b></span>
+					<span>Non observés <b id="gpc-unknown-count">0</b></span>
 				</div>
 				<div class="gpc-energy-summary gpc-muted">
 					<strong id="gpc-salvo-state"></strong>
@@ -3032,6 +3230,8 @@
 						<button id="gpc-auto-authorize" class="gpc-btn" type="button"></button>
 					</fieldset>
 				</details>
+				<details class="gpc-section">
+				<summary>Couleurs et priorités</summary>
 				<div class="gpc-row">
 					<label class="gpc-check"><input id="gpc-free" type="checkbox"> Couleurs gratuites</label>
 					<label class="gpc-check"><input id="gpc-alpha" type="checkbox"> Couleurs transparentes</label>
@@ -3066,8 +3266,9 @@
 					</div>
 					<div id="gpc-priority-list">Aucune</div>
 				</div>
-				<div class="gpc-section">
-					<div class="gpc-muted">Zones de peinture</div>
+				</details>
+				<details class="gpc-section">
+					<summary>Zones de peinture</summary>
 					<div class="gpc-muted" style="margin-top:3px;">Les rectangles verts délimitent la peinture. Les rectangles rouges marquent les exclusions.</div>
 					<div class="gpc-row" style="margin-top:6px;">
 						<select id="gpc-area-mode" class="gpc-input">
@@ -3089,13 +3290,13 @@
 						<button id="gpc-area-clear" class="gpc-btn gpc-grow" type="button">Effacer les zones</button>
 					</div>
 					<div id="gpc-area-list" class="gpc-muted">Aucune</div>
-				</div>
-				<div class="gpc-section">
-					<button id="gpc-buy-colors" class="gpc-btn gpc-grow" type="button" style="width:100%;">Acheter les couleurs manquantes</button>
-				</div>
-				<div class="gpc-section">
-					<button id="gpc-buy-capacity" class="gpc-btn gpc-grow" type="button" style="width:100%;">Augmenter la capacité d’énergie</button>
-				</div>
+				</details>
+				<details class="gpc-section">
+					<summary>Achats manuels et moniteur</summary>
+					<div class="gpc-row"><button id="gpc-buy-colors" class="gpc-btn gpc-grow" type="button">Acheter les couleurs manquantes</button></div>
+					<div class="gpc-row"><button id="gpc-buy-capacity" class="gpc-btn gpc-grow" type="button">Augmenter la capacité d’énergie</button></div>
+					<div class="gpc-row"><button id="gpc-connect-monitor" class="gpc-btn gpc-grow" type="button">Connecter le moniteur</button></div>
+				</details>
 			</div>
 		`;
 		document.body.appendChild(panel);
@@ -3111,8 +3312,13 @@
 		ui.dot = panel.querySelector("#gpc-dot");
 		ui.message = panel.querySelector("#gpc-message");
 		ui.bar = panel.querySelector("#gpc-bar");
+		ui.progress = panel.querySelector("#gpc-progress");
 		ui.countText = panel.querySelector("#gpc-count");
 		ui.remainingText = panel.querySelector("#gpc-left");
+		ui.wrongText = panel.querySelector("#gpc-wrong-count");
+		ui.emptyText = panel.querySelector("#gpc-empty-count");
+		ui.unknownText = panel.querySelector("#gpc-unknown-count");
+		ui.rateText = panel.querySelector("#gpc-rate");
 		ui.energyText = panel.querySelector("#gpc-energy");
 		ui.energyControls = panel.querySelector("#gpc-energy-controls");
 		ui.salvoState = panel.querySelector("#gpc-salvo-state");
@@ -3320,12 +3526,14 @@
 		if (!ui.panel || !ui.head) return;
 		const rect = ui.panel.getBoundingClientRect();
 		const maxLeft = Math.max(8, window.innerWidth - rect.width - 8);
-		const maxTop = Math.max(8, window.innerHeight - ui.head.offsetHeight - 8);
+		const minimumHeight = settings.minimized ? ui.head.offsetHeight : Math.min(rect.height, 240);
+		const maxTop = Math.max(8, window.innerHeight - minimumHeight - 8);
 		const left = Math.max(8, Math.min(maxLeft, rect.left));
 		const top = Math.max(8, Math.min(maxTop, rect.top));
 
 		ui.panel.style.left = left + "px";
 		ui.panel.style.top = top + "px";
+		ui.panel.style.setProperty("--gpc-top", top + "px");
 		ui.panel.style.right = "auto";
 
 		if (persist) {
@@ -3352,11 +3560,13 @@
 		ui.head.addEventListener("pointermove", (event) => {
 			if (!dragging) return;
 			const maxLeft = window.innerWidth - ui.panel.offsetWidth - 8;
-			const maxTop = window.innerHeight - ui.head.offsetHeight - 8;
+			const minimumHeight = settings.minimized ? ui.head.offsetHeight : Math.min(ui.panel.offsetHeight, 240);
+			const maxTop = window.innerHeight - minimumHeight - 8;
 			const left = Math.max(8, Math.min(maxLeft, event.clientX - offsetX));
 			const top = Math.max(8, Math.min(maxTop, event.clientY - offsetY));
 			ui.panel.style.left = left + "px";
 			ui.panel.style.top = top + "px";
+			ui.panel.style.setProperty("--gpc-top", top + "px");
 			ui.panel.style.right = "auto";
 		});
 
@@ -3376,7 +3586,11 @@
 		stop: requestStop,
 		sync: manualSync,
 		settings: () => ({ ...settings }),
-		clearCache: invalidateTargets,
+		clearCache() {
+			modelCache = null;
+			invalidateTargets();
+			updateProgress();
+		},
 		ignoreColors(input) {
 			const values = Array.isArray(input) ? input : parseColorList(input);
 			settings.ignoredColors = values.map(toColorId).filter((id) => id !== null);
