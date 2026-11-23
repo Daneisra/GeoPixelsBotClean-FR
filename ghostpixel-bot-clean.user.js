@@ -1,17 +1,16 @@
 // ==UserScript==
 // @name         GhostPixel Bot Clean
 // @namespace    https://github.com/Fox3225/GeoPixelsBotClean
-// @version      1.1.9-clean
-// @description  Clean and optimized GeoPixels userscript for painting ghost images, syncing progress, completion notifications, prioritizing colors, buying missing colors, and managing Energy Capacity.
+// @version      1.1.10
+// @description  Script GeoPixels pour peindre des images fantômes, synchroniser la progression, recevoir une notification de fin, gérer les priorités de couleurs, acheter les couleurs manquantes et augmenter la capacité d’énergie.
 // @author       Fox3225 + Codex
 // @match        https://geopixels.net/*
 // @match        https://*.geopixels.net/*
-// @icon         https://raw.githubusercontent.com/nymtuta/GeoPixelsBot/refs/heads/main/img/icon.png
 // @license      GPL-3.0
-// @homepageURL  https://github.com/Fox3225/GeoPixelsBotClean
-// @supportURL   https://github.com/Fox3225/GeoPixelsBotClean/issues
-// @downloadURL  https://raw.githubusercontent.com/Fox3225/GeoPixelsBotClean/main/ghostpixel-bot-clean.user.js
-// @updateURL    https://raw.githubusercontent.com/Fox3225/GeoPixelsBotClean/main/ghostpixel-bot-clean.user.js
+// @homepageURL  https://github.com/Daneisra/GeoPixelsBotClean-FR
+// @supportURL   https://github.com/Daneisra/GeoPixelsBotClean-FR/issues
+// @downloadURL  https://raw.githubusercontent.com/Daneisra/GeoPixelsBotClean-FR/main/ghostpixel-bot-clean.user.js
+// @updateURL    https://raw.githubusercontent.com/Daneisra/GeoPixelsBotClean-FR/main/ghostpixel-bot-clean.user.js
 // @run-at       document-idle
 // @connect      127.0.0.1
 // @grant        unsafeWindow
@@ -23,7 +22,7 @@
 	"use strict";
 
 	const win = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
-	const VERSION = "1.1.9-clean";
+	const VERSION = "1.1.10";
 	const ACCOUNT_MONITOR_URL = "http://127.0.0.1:47631/connect";
 	const TILE_SIZE = 1000;
 	const TILE_BATCH_SIZE = 9;
@@ -35,6 +34,16 @@
 	const MAX_COLOR_PURCHASES_PER_RUN = 5;
 	const ENERGY_CAPACITY_PURCHASE_CHUNK = 50;
 	const SETTINGS_KEY = "ghostpixel_clean_settings";
+	const STATUS_LABELS = {
+		idle: "Prêt",
+		syncing: "Synchronisation",
+		running: "Peinture",
+		waiting: "En attente",
+		buying: "Achat",
+		done: "Terminé",
+		stopped: "Arrêté",
+		error: "Erreur",
+	};
 
 	const FREE_COLOR_IDS = new Set([
 		"#FFFFFF", "#FFCA3A", "#FF595E", "#F3BBC2", "#BD637D", "#6A4C93",
@@ -51,7 +60,7 @@
 		localEnergy: null,
 		serverTimestamp: 0,
 		status: "idle",
-		message: "Pronto",
+		message: "Prêt",
 	};
 
 	let settings = loadSettings();
@@ -90,7 +99,10 @@
 
 	function storageSet(key, value) {
 		try {
-			if (win.localStorage) win.localStorage.setItem(key, value);
+			if (win.localStorage) {
+				win.localStorage.setItem(key, value);
+				return;
+			}
 		} catch {}
 		try {
 			localStorage.setItem(key, value);
@@ -110,6 +122,7 @@
 					const originalGetItem = Storage.prototype.getItem;
 					const originalSetItem = Storage.prototype.setItem;
 					const originalRemoveItem = Storage.prototype.removeItem;
+					let templateChanged = false;
 					const openDatabase = () => new Promise((resolve, reject) => {
 						const request = indexedDB.open(DB_NAME, 1);
 						request.onupgradeneeded = () => {
@@ -162,6 +175,7 @@
 						if (this !== window.localStorage || String(key) !== KEY) {
 							return originalSetItem.call(this, key, value);
 						}
+						templateChanged = true;
 						try {
 							originalSetItem.call(this, key, value);
 							window.__gpcLargeGhostValue = null;
@@ -171,12 +185,13 @@
 							originalRemoveItem.call(this, key);
 							window.__gpcLargeGhostValue = String(value);
 							writeLargeTemplate(String(value)).catch((storageError) => {
-								console.error("[GhostPixel] Failed to persist large template", storageError);
+								console.error("[GhostPixel] Impossible d’enregistrer le grand modèle", storageError);
 							});
 						}
 					};
 					Storage.prototype.removeItem = function (key) {
 						if (this === window.localStorage && String(key) === KEY) {
+							templateChanged = true;
 							window.__gpcLargeGhostValue = null;
 							deleteLargeTemplate().catch(() => {});
 						}
@@ -186,10 +201,11 @@
 					const restoreLargeTemplate = async () => {
 						if (originalGetItem.call(window.localStorage, KEY)) return;
 						const value = await readLargeTemplate();
-						if (!value) return;
+						if (!value || templateChanged || originalGetItem.call(window.localStorage, KEY)) return;
 						window.__gpcLargeGhostValue = value;
 						let attempts = 0;
 						const restoreWhenReady = () => {
+							if (templateChanged || window.__gpcLargeGhostValue !== value) return;
 							if (typeof window.initializeGhostFromStorage === "function") {
 								window.initializeGhostFromStorage();
 								return;
@@ -204,7 +220,7 @@
 			(document.documentElement || document.head).appendChild(script);
 			script.remove();
 		} catch (error) {
-			log("warn", "Nao foi possivel ativar o armazenamento de templates grandes.", error);
+			log("warn", "Impossible d’activer le stockage des grands modèles.", error);
 		}
 	}
 
@@ -245,7 +261,7 @@
 						const loginSubject = data.subject || (data.userData && data.userData.subject) || "";
 						if (!data.tokenUser || !Number.isFinite(parsedUserId) || !loginSubject) {
 							return {
-								error: "Dados de login nao encontrados. Atualize o GeoPixels ou faca login de novo.",
+								error: "Session GeoPixels introuvable. Actualisez la page ou reconnectez-vous.",
 								debug: {
 									hasToken: !!data.tokenUser,
 									hasSubject: !!loginSubject,
@@ -264,39 +280,28 @@
 						status: response.status,
 						text: await response.text().catch(() => "")
 					});
-					const redactBody = (body) => {
-						if (typeof body !== "string") return null;
+					const requestUrlOf = (input) => {
 						try {
-							const data = JSON.parse(body);
-							if (data.Token) data.Token = "[redacted]";
-							if (data.Subject) data.Subject = "[redacted]";
-							if (data.token) data.token = "[redacted]";
-							return data;
+							const url = new URL(input && input.url ? input.url : input, location.href);
+							return url.origin === location.origin ? url.pathname : "";
 						} catch {
-							return body.slice(0, 300);
+							return "";
 						}
 					};
-					const requestUrlOf = (input) => {
-						if (typeof input === "string") return input;
-						if (input && typeof input.url === "string") return input.url;
-						return "";
-					};
 					const shouldRecordFetch = (requestUrl) =>
-						/\\/(MakePurchase|GetUserData|PlacePixels)\\b/.test(requestUrl);
+						["/MakePurchase", "/GetUserData", "/PlacePixels"].includes(requestUrl);
 					if (!window.__gpcFetchEvents) {
 						Object.defineProperty(window, "__gpcFetchEvents", {
 							configurable: true,
 							value: []
 						});
 					}
-					const recordFetchEvent = (requestUrl, init, response, text) => {
+					const recordFetchEvent = (requestUrl, response) => {
 						try {
 							window.__gpcFetchEvents.push({
 								url: requestUrl,
 								ok: response.ok,
 								status: response.status,
-								body: redactBody(init && init.body),
-								text,
 								at: new Date().toISOString()
 							});
 							if (window.__gpcFetchEvents.length > 80) {
@@ -314,9 +319,7 @@
 							const requestUrl = requestUrlOf(input);
 							const response = await originalFetch(input, init);
 							if (shouldRecordFetch(requestUrl)) {
-								response.clone().text()
-									.then((text) => recordFetchEvent(requestUrl, init, response, text))
-									.catch(() => {});
+								recordFetchEvent(requestUrl, response);
 							}
 							return response;
 						};
@@ -376,7 +379,7 @@
 									Number.isFinite(pixel.UserId)
 								);
 							if (!cleanPixels.length) {
-								return { ok: false, status: 0, text: "Nenhum pixel valido para enviar." };
+								return { ok: false, status: 0, text: "Aucun pixel valide à envoyer." };
 							}
 							try {
 								return await readResponse(await fetch("/PlacePixels", {
@@ -407,6 +410,7 @@
 									ok: false,
 									status: 0,
 									text: error && error.message ? error.message : String(error),
+									requestUncertain: true,
 									type,
 									amount
 								};
@@ -447,7 +451,7 @@
 							const pageMap = readPageGlobal("map");
 							const pixelSize = Number(readPageGlobal("gridSize"));
 							if (!pageMap || !window.turf || !Number.isFinite(pixelSize)) {
-								reject(new Error("O mapa ainda nao esta pronto."));
+								reject(new Error("La carte est en cours de chargement."));
 								return;
 							}
 							const container = pageMap.getCanvasContainer();
@@ -462,7 +466,7 @@
 							const onKey = (event) => {
 								if (event.key !== "Escape") return;
 								cleanup();
-								reject(new Error("Selecao cancelada."));
+								reject(new Error("Sélection annulée."));
 							};
 							const onClick = (event) => {
 								if (!container.contains(event.target)) return;
@@ -753,10 +757,12 @@
 			(profileInput && profileInput.value) ||
 			"";
 		const userId = normalizeUserId(rawUserId);
-		const cached = authCache || {};
+		const token = readGlobal("tokenUser") || snapshot.tokenUser || storageGet("tokenUser") || "";
+		const cached = authCache && authCache.userId === userId &&
+			(token === authCache.token || token === authCache.previousToken) ? authCache : null;
 		return {
-			token: readGlobal("tokenUser") || snapshot.tokenUser || cached.token || storageGet("tokenUser") || "",
-			subject: readGlobal("subject") || snapshot.subject || (userData && userData.subject) || (snapshot.userData && snapshot.userData.subject) || cached.subject || "",
+			token: cached ? cached.token : token,
+			subject: readGlobal("subject") || snapshot.subject || (userData && userData.subject) || (snapshot.userData && snapshot.userData.subject) || (cached && cached.subject) || "",
 			userId,
 		};
 	}
@@ -775,8 +781,12 @@
 			if (!response.ok) return current;
 
 			const data = await response.json();
+			const latest = getAuthPayload();
+			if (latest.userId !== current.userId || latest.token !== current.token) return latest;
+
 			authCache = {
 				token: data.token || current.token,
+				previousToken: current.token,
 				subject: data.subject || current.subject || "",
 				userId: normalizeUserId(data.id) || current.userId,
 			};
@@ -888,26 +898,26 @@
 	}
 
 	async function connectAccountMonitor() {
-		setStatus("syncing", "Conectando o monitor local...");
+		setStatus("syncing", "Connexion au moniteur local…");
 		const popupName = "ghostpixel-monitor-connect";
 		let popup = null;
 		try {
 			popup = win.open("about:blank", popupName, "popup,width=460,height=220");
 			if (popup) {
 				popup.document.title = "GhostPixel Monitor";
-				popup.document.body.textContent = "Conectando ao GhostPixel Monitor...";
+				popup.document.body.textContent = "Connexion à GhostPixel Monitor…";
 			}
 		} catch {}
 		const auth = await getAuthPayloadAsync();
 		if (!auth.token || !Number.isFinite(auth.userId)) {
 			try { if (popup && !popup.closed) popup.close(); } catch {}
-			setStatus("error", "Dados da conta indisponiveis. Atualize a pagina ou faca login novamente.");
+			setStatus("error", "Données du compte indisponibles. Actualisez la page ou reconnectez-vous.");
 			return;
 		}
 
 		const data = JSON.stringify({ userId: auth.userId, token: String(auth.token) });
 		try {
-			const responsePayload = await new Promise((resolve, reject) => {
+			await new Promise((resolve, reject) => {
 				GM_xmlhttpRequest({
 					method: "POST",
 					url: ACCOUNT_MONITOR_URL,
@@ -920,21 +930,25 @@
 					onload: (response) => {
 						let payload = {};
 						try { payload = JSON.parse(response.responseText || "{}"); } catch {}
-						if (response.status === 200 && payload.ok !== false) {
-							resolve(payload);
+						if (response.status === 200 && payload?.ok !== false) {
+							resolve();
 							return;
 						}
-						const rejection = new Error(payload.message || ("Monitor respondeu HTTP " + response.status));
+						const rejection = new Error(
+							response.status === 200
+								? "Le moniteur a refusé la connexion."
+								: "Le moniteur a renvoyé le code HTTP " + response.status + "."
+						);
 						rejection.monitorResponse = true;
 						reject(rejection);
 					},
-					onerror: () => reject(new Error("falha de conexao")),
-					onabort: () => reject(new Error("conexao cancelada")),
-					ontimeout: () => reject(new Error("tempo esgotado")),
+					onerror: () => reject(new Error("échec de la connexion")),
+					onabort: () => reject(new Error("connexion annulée")),
+					ontimeout: () => reject(new Error("délai dépassé")),
 				});
 			});
 			try { if (popup && !popup.closed) popup.close(); } catch {}
-			setStatus("done", responsePayload.message || "Monitor conectado. Voce ja pode fechar o navegador.");
+			setStatus("done", "Moniteur connecté. Vous pouvez fermer le navigateur.");
 		} catch (error) {
 			if (error && error.monitorResponse) {
 				try { if (popup && !popup.closed) popup.close(); } catch {}
@@ -942,29 +956,28 @@
 				return;
 			}
 			try {
-				if (!popup || popup.closed) throw new Error("popup bloqueado");
-				const form = document.createElement("form");
+				if (!popup || popup.closed) throw new Error("fenêtre auxiliaire bloquée");
+				const form = popup.document.createElement("form");
 				form.method = "POST";
 				form.action = ACCOUNT_MONITOR_URL;
-				form.target = popupName;
 				form.enctype = "application/x-www-form-urlencoded";
 				for (const [name, value] of Object.entries({
 					channel: "connect-v1",
 					userId: String(auth.userId),
 					token: String(auth.token),
 				})) {
-					const input = document.createElement("input");
+					const input = popup.document.createElement("input");
 					input.type = "hidden";
 					input.name = name;
 					input.value = value;
 					form.appendChild(input);
 				}
-				document.body.appendChild(form);
+				popup.document.body.appendChild(form);
 				form.submit();
 				form.remove();
-				setStatus("done", "Conexao enviada ao monitor. A janela auxiliar fechara sozinha.");
+				setStatus("done", "Demande de connexion envoyée au moniteur. La fenêtre auxiliaire se fermera automatiquement.");
 			} catch {
-				setStatus("error", "Abra o GhostPixel Monitor e permita a janela auxiliar do navegador.");
+				setStatus("error", "Ouvrez GhostPixel Monitor et autorisez les fenêtres auxiliaires du navigateur.");
 			}
 		}
 	}
@@ -1005,23 +1018,23 @@
 
 		if (inclusions.length) {
 			let description = inclusions.length === 1
-				? "somente dentro do retangulo verde"
-				: "somente dentro dos " + inclusions.length + " retangulos verdes";
+				? "dans le rectangle vert"
+				: "dans les " + inclusions.length + " rectangles verts";
 			if (exclusions.length) {
 				description += exclusions.length === 1
-					? ", descontando a area vermelha"
-					: ", descontando as " + exclusions.length + " areas vermelhas";
+					? ", hors de la zone rouge"
+					: ", hors des " + exclusions.length + " zones rouges";
 			}
 			return description;
 		}
 
 		if (exclusions.length) {
 			return exclusions.length === 1
-				? "fora do retangulo vermelho"
-				: "fora dos " + exclusions.length + " retangulos vermelhos";
+				? "hors du rectangle rouge"
+				: "hors des " + exclusions.length + " rectangles rouges";
 		}
 
-		return "em toda a arte";
+		return "sur toute l’image";
 	}
 
 	function urlToString(input) {
@@ -1041,7 +1054,7 @@
 
 	function installPurchaseObserver() {
 		if (purchaseObserverInstalled) return;
-		if (typeof win.fetch !== "function") throw new Error("fetch indisponivel na pagina.");
+		if (typeof win.fetch !== "function") throw new Error("La fonction fetch est indisponible sur la page.");
 
 		originalFetch = win.fetch.bind(win);
 		win.fetch = async function (input, init) {
@@ -1079,7 +1092,7 @@
 			if (typeof fn === "function") return fn.bind(win);
 			await delay(200);
 		}
-		throw new Error("Funcao da pagina indisponivel: " + name);
+		throw new Error("Fonction GeoPixels indisponible : " + name);
 	}
 
 	function normalizeEndpointResult(result, extra = {}) {
@@ -1089,6 +1102,7 @@
 			ok: !!result.ok,
 			status: Number.isFinite(status) ? status : 0,
 			text: typeof result.text === "string" ? result.text : "",
+			requestUncertain: result.requestUncertain === true,
 			...extra,
 		};
 	}
@@ -1103,12 +1117,15 @@
 					await win.__gpcMakePurchase(type, normalizedAmount),
 					{ type, amount: normalizedAmount }
 				);
-				if (bridgeResult && (bridgeResult.ok || bridgeResult.status !== 0)) return bridgeResult;
+				if (bridgeResult && (bridgeResult.ok || bridgeResult.status !== 0 || bridgeResult.requestUncertain)) {
+					return bridgeResult;
+				}
 			} catch (error) {
 				bridgeResult = {
 					ok: false,
 					status: 0,
 					text: error && error.message ? error.message : String(error),
+					requestUncertain: true,
 					type,
 					amount: normalizedAmount,
 				};
@@ -1122,7 +1139,7 @@
 				status: 0,
 				text: bridgeResult && bridgeResult.text
 					? bridgeResult.text
-					: "Dados de login insuficientes para /MakePurchase.",
+					: "Session GeoPixels incomplète. Reconnectez-vous avant d’effectuer un achat.",
 				type,
 				amount: normalizedAmount,
 			};
@@ -1167,7 +1184,7 @@
 		return {
 			ok: false,
 			status: 0,
-			text: "Nenhuma resposta de /MakePurchase foi observada.",
+			text: "Aucune réponse reçue pour l’achat.",
 			type,
 			amount,
 		};
@@ -1179,18 +1196,18 @@
 			direct = await withTimeout(
 				callPurchaseEndpoint(type, amount),
 				PURCHASE_RESULT_TIMEOUT_MS,
-				"A compra demorou demais e foi interrompida."
+				"Délai d’attente dépassé. Vérifiez le résultat de l’achat avant de réessayer."
 			);
 		} catch (error) {
 			return {
 				ok: false,
 				status: 0,
-				text: error && error.message ? error.message : "Tempo limite excedido na compra.",
+				text: error && error.message ? error.message : "Délai d’attente dépassé pour l’achat.",
 				type,
 				amount,
 			};
 		}
-		if (direct && (direct.ok || direct.status !== 0)) return direct;
+		if (direct && (direct.ok || direct.status !== 0 || direct.requestUncertain)) return direct;
 
 		installPurchaseObserver();
 		try {
@@ -1199,7 +1216,7 @@
 			const returned = await withTimeout(
 				makePurchase(type, amount),
 				PURCHASE_RESULT_TIMEOUT_MS,
-				"A compra demorou demais e foi interrompida."
+				"Délai d’attente dépassé. Vérifiez le résultat de l’achat avant de réessayer."
 			);
 			if (returned && typeof returned === "object" && "ok" in returned) return returned;
 			const observed = await waitForPurchaseResult(type, amount, startedAt);
@@ -1249,7 +1266,7 @@
 		const skipOrdering = !!options.skipOrdering;
 		const source = getGhostSource();
 		if (!source) {
-			throw new Error("Ghost image nao carregada. Carregue ou posicione a ghost image no GeoPixels primeiro.");
+			throw new Error("Chargez et positionnez une image fantôme dans GeoPixels.");
 		}
 
 		const sourceKey = [
@@ -1377,10 +1394,10 @@
 
 	async function getMissingRequiredColors() {
 		const owned = getOwnedColorIds();
-		if (!owned) throw new Error("Lista de cores compradas ainda nao carregou no GeoPixels.");
+		if (!owned) throw new Error("GeoPixels charge encore la liste des couleurs achetées.");
 
-		// Buying only needs pixels whose paid colors are not owned. Avoiding the
-		// normal priority sort keeps large templates responsive during this scan.
+		// Seuls les pixels aux couleurs payantes non acquises comptent pour l’achat.
+		// Ignorer le tri des priorités accélère la vérification des grands modèles.
 		const purchaseOptions = {
 			includeUnowned: true,
 			onlyUnowned: true,
@@ -1404,8 +1421,8 @@
 			}
 			if (unsyncedCount) {
 				throw new Error(
-					"Nao foi possivel verificar " + unsyncedCount +
-					" pixel(s) no tabuleiro. Tente sincronizar novamente antes de comprar."
+					"Impossible de vérifier " + unsyncedCount +
+					" pixel(s) sur la carte. Relancez la synchronisation avant de réessayer l’achat."
 				);
 			}
 
@@ -1426,11 +1443,11 @@
 			if (typeof Notification !== "undefined" && Notification.permission === "default") {
 				const permissionRequest = Notification.requestPermission();
 				if (permissionRequest && typeof permissionRequest.catch === "function") {
-					permissionRequest.catch((error) => log("warn", "Nao foi possivel solicitar notificacoes.", error));
+					permissionRequest.catch((error) => log("warn", "Impossible de demander l’autorisation d’afficher des notifications.", error));
 				}
 			}
 		} catch (error) {
-			log("warn", "Nao foi possivel preparar as notificacoes.", error);
+			log("warn", "Impossible de préparer les notifications.", error);
 		}
 	}
 
@@ -1438,25 +1455,24 @@
 		if (completionNotificationSent || !hadPendingTargets) return;
 		completionNotificationSent = true;
 
-		const title = "GhostPixel - Arte concluida!";
-		const text = "Todos os pixels da imagem foram finalizados.";
-		const icon = "https://raw.githubusercontent.com/nymtuta/GeoPixelsBot/refs/heads/main/img/icon.png";
+		const title = "GhostPixel · Peinture terminée";
+		const text = "Tous les pixels sélectionnés de l’image sont terminés.";
 		const focusPage = () => {
 			try { window.focus(); } catch {}
 		};
 
 		try {
 			if (typeof GM_notification === "function") {
-				GM_notification({ title, text, image: icon, timeout: 12000, onclick: focusPage });
+				GM_notification({ title, text, timeout: 12000, onclick: focusPage });
 				return;
 			}
 			if (typeof GM !== "undefined" && typeof GM.notification === "function") {
-				Promise.resolve(GM.notification({ title, text, image: icon, timeout: 12000, onclick: focusPage }))
-					.catch((error) => log("warn", "Falha ao exibir a notificacao.", error));
+				Promise.resolve(GM.notification({ title, text, timeout: 12000, onclick: focusPage }))
+					.catch((error) => log("warn", "Impossible d’afficher la notification.", error));
 				return;
 			}
 			if (typeof Notification !== "undefined" && Notification.permission === "granted") {
-				const notification = new Notification(title, { body: text, icon });
+				const notification = new Notification(title, { body: text });
 				notification.onclick = () => {
 					focusPage();
 					notification.close();
@@ -1464,21 +1480,21 @@
 				setTimeout(() => notification.close(), 12000);
 				return;
 			}
-			log("warn", "Arte concluida, mas as notificacoes nao estao autorizadas.");
+			log("warn", "Peinture terminée. Autorisez les notifications pour recevoir une alerte.");
 		} catch (error) {
-			log("warn", "Falha ao exibir a notificacao.", error);
+			log("warn", "Impossible d’afficher la notification.", error);
 		}
 	}
 
 	async function buyColor(colorId) {
 		colorId = toColorId(colorId);
-		if (colorId === null || colorId === -1) throw new Error("Cor invalida para compra.");
+		if (colorId === null || colorId === -1) throw new Error("Couleur invalide pour l’achat.");
 		const hex = colorHex(colorId);
-		setStatus("buying", "Comprando cor " + hex + "...");
+		setStatus("buying", "Achat de la couleur " + hex + "...");
 		const result = await callPagePurchase("ExtraColor", hex);
 		if (result.status === 402) return "insufficient";
 		if (!result.ok) {
-			log("warn", "Falha ao comprar cor", hex, result.status, result.text);
+			log("warn", "Échec de l’achat de la couleur", hex, result.status, result.text);
 			return false;
 		}
 
@@ -1496,11 +1512,11 @@
 			const chunkAmount = Math.min(remaining, chunkSize);
 			setStatus(
 				"buying",
-				"Comprando Energy Capacity " + bought + "/" + amount + "..."
+				"Achat de capacité d’énergie " + bought + "/" + amount + "..."
 			);
 
 			const result = await callPagePurchase("EnergyCapacity", chunkAmount);
-			log("log", "EnergyCapacity purchase result", {
+			log("log", "Résultat de l’achat de capacité d’énergie", {
 				chunkAmount,
 				ok: result && result.ok,
 				status: result && result.status,
@@ -1512,12 +1528,13 @@
 					chunkSize = Math.max(1, Math.floor(chunkAmount / 2));
 					continue;
 				}
-				setStatus("waiting", "Pixels insuficientes para Energy Capacity.");
+				setStatus("waiting", "Solde de pixels insuffisant pour augmenter la capacité d’énergie.");
 				return bought > 0 ? true : "insufficient";
 			}
 			if (!result || !result.ok) {
-				log("warn", "Falha ao comprar Energy Capacity", result && result.status, result && result.text);
-				setStatus("error", "Falha ao comprar Energy Capacity: " + (result && result.status) + " " + ((result && result.text) || ""));
+				log("warn", "Échec de l’achat de capacité d’énergie", result && result.status, result && result.text);
+				const detail = result?.status ? " (HTTP " + result.status + ")" : "";
+				setStatus("error", "Échec de l’achat de capacité d’énergie" + detail + ".");
 				return bought > 0 ? true : false;
 			}
 
@@ -1528,49 +1545,49 @@
 		}
 
 		state.localEnergy = null;
-		setStatus("done", "Energy Capacity comprado: +" + (bought * 5) + " max.");
+		setStatus("done", "Capacité d’énergie augmentée de " + (bought * 5) + " unités.");
 		return true;
 	}
 
 	async function buyAllAffordableEnergyCapacity() {
 		const availablePixels = await fetchAvailablePixels();
 		const amount = Math.floor(availablePixels / 50);
-		log("log", "EnergyCapacity buy-all calculation", { availablePixels, amount });
+		log("log", "Calcul de la capacité d’énergie disponible à l’achat", { availablePixels, amount });
 		if (amount < 1) {
-			setStatus("done", "Paint concluido. Pixels insuficientes para Energy Capacity.");
+			setStatus("waiting", "Solde de pixels insuffisant pour augmenter la capacité d’énergie.");
 			return false;
 		}
 
-		setStatus("buying", "Usando " + (amount * 50) + "/" + availablePixels + " Pixels em Energy Capacity...");
+		setStatus("buying", "Dépense de " + (amount * 50) + "/" + availablePixels + " pixels pour augmenter la capacité d’énergie…");
 		return buyEnergyCapacity(amount);
 	}
 
 	async function buyMissingGhostColors() {
 		if (state.running) {
-			throw new Error("Pare o bot antes de comprar cores.");
+			throw new Error("Arrêtez la peinture avant d’acheter des couleurs.");
 		}
 
 		const areaScope = describeAreaPurchaseScope();
-		setStatus("syncing", "Verificando cores pendentes " + areaScope + "...");
+		setStatus("syncing", "Recherche des couleurs manquantes " + areaScope + "...");
 		const missing = await getMissingRequiredColors();
 		if (!missing.length) {
-			setStatus("idle", "Nenhuma cor precisa ser comprada para os pixels pendentes " + areaScope + ".");
+			setStatus("idle", "Vous avez déjà toutes les couleurs nécessaires pour les pixels restants " + areaScope + ".");
 			return { bought: 0, total: 0, insufficient: false };
 		}
 		const purchaseBatch = missing.slice(0, MAX_COLOR_PURCHASES_PER_RUN);
 		const deferred = missing.length - purchaseBatch.length;
 
 		const ok = confirm(
-			"Comprar " + purchaseBatch.length +
-			" cor(es) necessaria(s) apenas para os pixels que ainda nao estao prontos " +
+			"Acheter " + purchaseBatch.length +
+			" couleur(s) nécessaire(s) pour les pixels restants " +
 			areaScope + "?" +
 			(deferred > 0
-				? "\n\nO limite e de " + MAX_COLOR_PURCHASES_PER_RUN +
-					" por vez. Outras " + deferred + " cor(es) ficarao para a proxima compra."
+				? "\n\nLa limite par achat est de " + MAX_COLOR_PURCHASES_PER_RUN +
+					" couleurs. Les " + deferred + " couleur(s) restante(s) pourront être achetées ensuite."
 				: "")
 		);
 		if (!ok) {
-			setStatus("idle", "Compra cancelada.");
+			setStatus("idle", "Achat annulé.");
 			return { bought: 0, total: purchaseBatch.length, remaining: missing.length, cancelled: true };
 		}
 
@@ -1578,13 +1595,13 @@
 		for (const colorId of purchaseBatch) {
 			const result = await buyColor(colorId);
 			if (result === "insufficient") {
-				setStatus("waiting", "Pixels insuficientes. Compradas " + bought + "/" + purchaseBatch.length + ".");
+				setStatus("waiting", "Solde de pixels insuffisant. Couleurs achetées : " + bought + "/" + purchaseBatch.length + ".");
 				invalidateTargets({ preserveProgress: true });
 				return { bought, total: purchaseBatch.length, remaining: missing.length - bought, insufficient: true };
 			}
 			if (result !== true) {
 				const remaining = missing.length - bought;
-				setStatus("error", "A compra falhou e o lote foi interrompido para evitar travamentos. Ainda faltam " + remaining + " cor(es).");
+				setStatus("error", "Achat interrompu après un échec. Couleurs restantes : " + remaining + ".");
 				invalidateTargets({ preserveProgress: true });
 				return { bought, total: purchaseBatch.length, remaining, failed: true, insufficient: false };
 			}
@@ -1596,8 +1613,8 @@
 		const remaining = missing.length - bought;
 		setStatus(
 			"idle",
-			bought + "/" + purchaseBatch.length + " cor(es) comprada(s)." +
-			(remaining > 0 ? " Ainda faltam " + remaining + " cor(es)." : "")
+			bought + "/" + purchaseBatch.length + " couleur(s) achetée(s)." +
+			(remaining > 0 ? " Couleurs restantes : " + remaining + "." : "")
 		);
 		return { bought, total: purchaseBatch.length, remaining, insufficient: false };
 	}
@@ -1607,7 +1624,7 @@
 			const img = new Image();
 			img.decoding = "async";
 			img.onload = () => resolve(img);
-			img.onerror = reject;
+			img.onerror = () => reject(new Error("Impossible de lire l’image de la tuile."));
 			img.src = src;
 		});
 	}
@@ -1655,7 +1672,7 @@
 		});
 
 		if (!response.ok) {
-			throw new Error("GetPixelsCached failed: " + response.status + " " + await response.text());
+			throw new Error("Échec du chargement des tuiles (HTTP " + response.status + ").");
 		}
 		return response.json();
 	}
@@ -1664,7 +1681,7 @@
 		const cache = buildTargets(options);
 		if (!cache.tileKeys.length) return;
 
-		setStatus("syncing", "Sincronizando " + cache.tileKeys.length + " tile(s)...");
+		setStatus("syncing", "Synchronisation de " + cache.tileKeys.length + " tuile(s)…");
 		for (const group of chunk(cache.tileKeys.map(parseTileKey), TILE_BATCH_SIZE)) {
 			if (state.stopRequested) return;
 
@@ -1732,9 +1749,9 @@
 		const h = Math.floor(seconds / 3600);
 		const m = Math.floor((seconds % 3600) / 60);
 		const s = seconds % 60;
-		if (h > 0) return h + "h " + m + "m";
-		if (m > 0) return m + "m " + s + "s";
-		return s + "s";
+		if (h > 0) return h + " h " + m + " min";
+		if (m > 0) return m + " min " + s + " s";
+		return s + " s";
 	}
 
 	function estimateEta(remaining) {
@@ -1758,7 +1775,7 @@
 			);
 
 		if (!pixels.length) {
-			return { ok: false, status: 0, text: "Nenhum pixel valido para enviar." };
+			return { ok: false, status: 0, text: "Aucun pixel valide à envoyer." };
 		}
 
 		let bridgeResult = null;
@@ -1772,7 +1789,7 @@
 					return bridgeResult;
 				}
 				if (bridgeResult && bridgeResult.status !== 0) {
-					log("warn", "PlacePixels failed via page bridge", {
+					log("warn", "Échec de l’envoi des pixels via la page", {
 						status: bridgeResult.status,
 						text: bridgeResult.text,
 						pixelCount: pixels.length,
@@ -1796,7 +1813,7 @@
 				status: 0,
 				text: bridgeResult && bridgeResult.text
 					? bridgeResult.text
-					: "Token ou userID nao encontrados. Faca login no GeoPixels de novo.",
+					: "Session GeoPixels introuvable. Reconnectez-vous.",
 			};
 		}
 		if (!auth.subject) {
@@ -1805,7 +1822,7 @@
 				status: 0,
 				text: bridgeResult && bridgeResult.text
 					? bridgeResult.text
-					: "Subject de login nao encontrado. A sessao salva nao retornou /TryLogIn.",
+					: "Session GeoPixels incomplète. Reconnectez-vous.",
 			};
 		}
 
@@ -1828,7 +1845,7 @@
 
 		if (!response.ok) {
 			const text = await response.text();
-			log("warn", "PlacePixels failed", {
+			log("warn", "Échec de l’envoi des pixels", {
 				status: response.status,
 				text,
 				userIdType: typeof payload.UserId,
@@ -1875,7 +1892,7 @@
 		setButtons();
 
 		try {
-			setStatus("running", "Preparando alvo...");
+			setStatus("running", "Préparation de l’image…");
 			buildTargets();
 			await syncBoard();
 
@@ -1886,31 +1903,33 @@
 				updateProgress();
 
 				if (!remainingTargets.length) {
-					setStatus("done", "Pronto. Todos os pixels ja estao corretos.");
+					setStatus("done", "Tous les pixels sélectionnés sont déjà corrects.");
 					notifyCompletion();
 					break;
 				}
 
 				const energy = await fetchCurrentEnergy();
 				if (energy <= 0) {
-					setStatus("waiting", "Sem energia. Aguardando recarga...");
+					setStatus("waiting", "Énergie épuisée. Recharge en cours…");
 					await wait(readEnergyRateMs());
 					continue;
 				}
 
 				const amount = Math.min(energy, remainingTargets.length, MAX_PIXELS_PER_REQUEST);
 				const batch = remainingTargets.slice(0, amount);
-				setStatus("running", "Enviando " + amount + " pixel(s)...");
+				setStatus("running", "Envoi de " + amount + " pixel(s)…");
 
 				const result = await sendPixelBatch(batch);
 				if (!result.ok) {
-					const message = "Send failed: " + result.status + " " + result.text;
-					log("warn", message);
+					const message = result.status === 0
+						? "Envoi des pixels impossible. Vérifiez votre connexion et votre session GeoPixels."
+						: "Échec de l’envoi des pixels (HTTP " + result.status + ").";
+					log("warn", message, result.text);
 					setStatus(result.status === 401 ? "error" : "waiting", message);
 					if (result.status === 401) break;
 					if (result.status === 403 && /not enough energy/i.test(result.text || "")) {
 						state.localEnergy = 0;
-						setStatus("waiting", "Energia insuficiente. Aguardando recarga...");
+						setStatus("waiting", "Énergie insuffisante. Recharge en cours…");
 						await wait(readEnergyRateMs());
 						continue;
 					}
@@ -1924,7 +1943,7 @@
 				updateProgress();
 
 				if (state.remaining === 0) {
-					setStatus("done", "Pronto. Todos os pixels foram enviados.");
+					setStatus("done", "Tous les pixels sélectionnés ont été envoyés.");
 					notifyCompletion();
 					break;
 				}
@@ -1933,10 +1952,12 @@
 				await syncBoard();
 			}
 
-			if (state.stopRequested) setStatus("stopped", "Parado");
+			if (state.stopRequested) setStatus("stopped", "Arrêté");
 		} catch (error) {
 			log("error", error);
-			setStatus("error", error && error.message ? error.message : String(error));
+			setStatus("error", error instanceof TypeError
+				? "La peinture a été interrompue. Vérifiez votre connexion à GeoPixels."
+				: error?.message || "La peinture a été interrompue.");
 		} finally {
 			state.running = false;
 			state.stopRequested = false;
@@ -1951,11 +1972,13 @@
 			await syncBoard();
 			const remainingTargets = getRemainingTargets();
 			state.remaining = remainingTargets.length;
-			setStatus("idle", "Sincronizado");
+			setStatus("idle", "Synchronisation terminée");
 			updateProgress();
 		} catch (error) {
 			log("error", error);
-			setStatus("error", error && error.message ? error.message : String(error));
+			setStatus("error", error instanceof TypeError
+				? "Impossible de synchroniser l’image. Vérifiez votre connexion à GeoPixels."
+				: error?.message || "Impossible de synchroniser l’image.");
 		}
 	}
 
@@ -1963,7 +1986,7 @@
 		state.status = status;
 		if (message) state.message = message;
 		if (ui.status) {
-			ui.status.textContent = status;
+			ui.status.textContent = STATUS_LABELS[status];
 			ui.status.dataset.status = status;
 		}
 		if (ui.message) ui.message.textContent = state.message;
@@ -2015,7 +2038,7 @@
 	function addArea(area) {
 		const normalized = normalizeArea(area, settings.areas.length);
 		if (!normalized) {
-			setStatus("error", "Informe coordenadas validas para os dois cantos.");
+			setStatus("error", "Saisissez des coordonnées valides pour les deux coins.");
 			return false;
 		}
 		settings.areas.push(normalized);
@@ -2023,8 +2046,8 @@
 		setStatus(
 			"idle",
 			normalized.mode === "include"
-				? "Area exclusiva de pintura adicionada."
-				: "Area excluida da pintura."
+				? "Zone de peinture ajoutée."
+				: "Zone d’exclusion ajoutée."
 		);
 		return true;
 	}
@@ -2033,25 +2056,25 @@
 		if (!ui.areaList) return;
 		ui.areaList.innerHTML = "";
 		if (!settings.areas.length) {
-			ui.areaList.textContent = "Nenhuma";
+			ui.areaList.textContent = "Aucune";
 		} else {
 			for (const area of settings.areas) {
 				const item = document.createElement("div");
 				item.className = "gpc-area-item";
 				item.dataset.mode = area.mode;
 				const title = document.createElement("strong");
-				title.textContent = area.mode === "include" ? "Somente dentro" : "Área excluída";
+				title.textContent = area.mode === "include" ? "Zone de peinture" : "Zone d’exclusion";
 				const coordinates = document.createElement("span");
-				coordinates.textContent = `(${area.x1}, ${area.y1}) até (${area.x2}, ${area.y2})`;
+				coordinates.textContent = `(${area.x1}, ${area.y1}) à (${area.x2}, ${area.y2})`;
 				coordinates.className = "gpc-muted";
 				const remove = document.createElement("button");
 				remove.type = "button";
 				remove.className = "gpc-btn gpc-area-remove";
-				remove.textContent = "Remover";
+				remove.textContent = "Retirer";
 				remove.addEventListener("click", () => {
 					settings.areas = settings.areas.filter((candidate) => candidate.id !== area.id);
 					applyFiltersChanged();
-					setStatus("idle", "Area removida.");
+					setStatus("idle", "Zone retirée.");
 				});
 				item.append(title, coordinates, remove);
 				ui.areaList.appendChild(item);
@@ -2068,7 +2091,7 @@
 	function renderColorChips(element, colors) {
 		if (!element) return;
 		if (!colors.length) {
-			element.textContent = "Nenhuma";
+			element.textContent = "Aucune";
 			return;
 		}
 		element.innerHTML = "";
@@ -2316,94 +2339,95 @@
 
 		const panel = document.createElement("div");
 		panel.id = "gpc-panel";
+		panel.lang = "fr";
 		panel.innerHTML = `
 			<div id="gpc-head">
 				<div class="gpc-title"><span id="gpc-dot"></span><span>GhostPixel</span></div>
 				<div class="gpc-row">
-					<span id="gpc-status">idle</span>
-					<button id="gpc-min" type="button" title="Minimize">-</button>
+					<span id="gpc-status">${STATUS_LABELS.idle}</span>
+					<button id="gpc-min" type="button" title="Réduire">-</button>
 				</div>
 			</div>
 			<div id="gpc-body">
 				<div class="gpc-row">
-					<button id="gpc-start" class="gpc-btn gpc-primary gpc-grow" type="button">Iniciar</button>
-					<button id="gpc-stop" class="gpc-btn gpc-danger gpc-grow" type="button">Parar</button>
-					<button id="gpc-sync" class="gpc-btn" type="button">Sync</button>
+					<button id="gpc-start" class="gpc-btn gpc-primary gpc-grow" type="button">Démarrer</button>
+					<button id="gpc-stop" class="gpc-btn gpc-danger gpc-grow" type="button">Arrêter</button>
+					<button id="gpc-sync" class="gpc-btn" type="button">Synchroniser</button>
 				</div>
 				<div class="gpc-row">
-					<button id="gpc-connect-monitor" class="gpc-btn gpc-grow" type="button">Conectar Monitor</button>
+					<button id="gpc-connect-monitor" class="gpc-btn gpc-grow" type="button">Connecter le moniteur</button>
 				</div>
-				<div id="gpc-message">Pronto</div>
+				<div id="gpc-message">Prêt</div>
 				<div id="gpc-progress"><div id="gpc-bar"></div></div>
 				<div class="gpc-stats">
-					<div class="gpc-stat"><b>Feitos</b><span id="gpc-count">0 / 0</span></div>
-					<div class="gpc-stat"><b>Faltam</b><span id="gpc-left">0</span></div>
-					<div class="gpc-stat"><b>Energia</b><span id="gpc-energy">0</span></div>
-					<div class="gpc-stat"><b>ETA</b><span id="gpc-eta">-</span></div>
+					<div class="gpc-stat"><b>Peints</b><span id="gpc-count">0 / 0</span></div>
+					<div class="gpc-stat"><b>Restants</b><span id="gpc-left">0</span></div>
+					<div class="gpc-stat"><b>Énergie</b><span id="gpc-energy">0</span></div>
+					<div class="gpc-stat"><b>Temps estimé</b><span id="gpc-eta">-</span></div>
 				</div>
 				<div class="gpc-row">
-					<label class="gpc-check"><input id="gpc-free" type="checkbox"> Cores gratis</label>
-					<label class="gpc-check"><input id="gpc-alpha" type="checkbox"> Transparentes</label>
+					<label class="gpc-check"><input id="gpc-free" type="checkbox"> Couleurs gratuites</label>
+					<label class="gpc-check"><input id="gpc-alpha" type="checkbox"> Couleurs transparentes</label>
 				</div>
 				<div class="gpc-row">
-					<label class="gpc-check"><input id="gpc-smart-priority" type="checkbox"> Prioridade inteligente</label>
+					<label class="gpc-check"><input id="gpc-smart-priority" type="checkbox"> Priorité intelligente</label>
 				</div>
 				<div class="gpc-row">
-					<label class="gpc-check"><input id="gpc-wrong-color-priority" type="checkbox"> Priorizar cores incorretas</label>
+					<label class="gpc-check"><input id="gpc-wrong-color-priority" type="checkbox"> Corriger les couleurs incorrectes en priorité</label>
 				</div>
-				<div class="gpc-muted" style="margin-top:3px;">Corrige pixels ocupados antes de preencher os vazios.</div>
+				<div class="gpc-muted" style="margin-top:3px;">Corrige les pixels déjà peints avant de remplir les emplacements vides.</div>
 				<div class="gpc-section">
-					<div class="gpc-muted">Excluir cores</div>
+					<div class="gpc-muted">Exclure des couleurs</div>
 					<div class="gpc-row" style="margin-top:6px;">
 						<input id="gpc-ignore-input" class="gpc-input" type="text" placeholder="#FF0000, #00FF00">
 					</div>
 					<div class="gpc-row">
-						<button id="gpc-ignore-add" class="gpc-btn gpc-grow" type="button">Adicionar</button>
-						<button id="gpc-ignore-clear" class="gpc-btn gpc-grow" type="button">Limpar</button>
+						<button id="gpc-ignore-add" class="gpc-btn gpc-grow" type="button">Ajouter</button>
+						<button id="gpc-ignore-clear" class="gpc-btn gpc-grow" type="button">Effacer</button>
 					</div>
-					<div id="gpc-ignored-list">Nenhuma</div>
+					<div id="gpc-ignored-list">Aucune</div>
 				</div>
 				<div class="gpc-section">
-					<div class="gpc-muted">Priorizar cores</div>
-					<div class="gpc-muted" style="margin-top:3px;">Quando preenchido, coloca apenas essas cores.</div>
+					<div class="gpc-muted">Couleurs prioritaires</div>
+					<div class="gpc-muted" style="margin-top:3px;">Si la liste contient des couleurs, seules celles-ci sont peintes.</div>
 					<div class="gpc-row" style="margin-top:6px;">
 						<input id="gpc-priority-input" class="gpc-input" type="text" placeholder="#FF0000, #00FF00">
 					</div>
 					<div class="gpc-row">
-						<button id="gpc-priority-add" class="gpc-btn gpc-grow" type="button">Adicionar</button>
-						<button id="gpc-priority-clear" class="gpc-btn gpc-grow" type="button">Limpar</button>
+						<button id="gpc-priority-add" class="gpc-btn gpc-grow" type="button">Ajouter</button>
+						<button id="gpc-priority-clear" class="gpc-btn gpc-grow" type="button">Effacer</button>
 					</div>
-					<div id="gpc-priority-list">Nenhuma</div>
+					<div id="gpc-priority-list">Aucune</div>
 				</div>
 				<div class="gpc-section">
-					<div class="gpc-muted">Áreas de pintura</div>
-					<div class="gpc-muted" style="margin-top:3px;">Verde: pintar somente dentro. Vermelho: não pintar dentro.</div>
+					<div class="gpc-muted">Zones de peinture</div>
+					<div class="gpc-muted" style="margin-top:3px;">Les rectangles verts délimitent la peinture. Les rectangles rouges marquent les exclusions.</div>
 					<div class="gpc-row" style="margin-top:6px;">
 						<select id="gpc-area-mode" class="gpc-input">
-							<option value="include">Pintar somente nesta área</option>
-							<option value="exclude">Excluir esta área</option>
+							<option value="include">Peindre dans cette zone</option>
+							<option value="exclude">Exclure cette zone</option>
 						</select>
 					</div>
 					<div class="gpc-area-inputs">
-						<input id="gpc-area-x1" class="gpc-input" type="number" placeholder="X do canto 1">
-						<input id="gpc-area-y1" class="gpc-input" type="number" placeholder="Y do canto 1">
-						<input id="gpc-area-x2" class="gpc-input" type="number" placeholder="X do canto 2">
-						<input id="gpc-area-y2" class="gpc-input" type="number" placeholder="Y do canto 2">
+						<input id="gpc-area-x1" class="gpc-input" type="number" placeholder="X du coin 1">
+						<input id="gpc-area-y1" class="gpc-input" type="number" placeholder="Y du coin 1">
+						<input id="gpc-area-x2" class="gpc-input" type="number" placeholder="X du coin 2">
+						<input id="gpc-area-y2" class="gpc-input" type="number" placeholder="Y du coin 2">
 					</div>
 					<div class="gpc-row">
-						<button id="gpc-area-select" class="gpc-btn gpc-grow" type="button">Selecionar no mapa</button>
-						<button id="gpc-area-add" class="gpc-btn gpc-grow" type="button">Adicionar</button>
+						<button id="gpc-area-select" class="gpc-btn gpc-grow" type="button">Sélectionner sur la carte</button>
+						<button id="gpc-area-add" class="gpc-btn gpc-grow" type="button">Ajouter</button>
 					</div>
 					<div class="gpc-row">
-						<button id="gpc-area-clear" class="gpc-btn gpc-grow" type="button">Limpar áreas</button>
+						<button id="gpc-area-clear" class="gpc-btn gpc-grow" type="button">Effacer les zones</button>
 					</div>
-					<div id="gpc-area-list" class="gpc-muted">Nenhuma</div>
+					<div id="gpc-area-list" class="gpc-muted">Aucune</div>
 				</div>
 				<div class="gpc-section">
-					<button id="gpc-buy-colors" class="gpc-btn gpc-grow" type="button" style="width:100%;">Comprar cores pendentes</button>
+					<button id="gpc-buy-colors" class="gpc-btn gpc-grow" type="button" style="width:100%;">Acheter les couleurs manquantes</button>
 				</div>
 				<div class="gpc-section">
-					<button id="gpc-buy-capacity" class="gpc-btn gpc-grow" type="button" style="width:100%;">Comprar Energy Capacity agora</button>
+					<button id="gpc-buy-capacity" class="gpc-btn gpc-grow" type="button" style="width:100%;">Augmenter la capacité d’énergie</button>
 				</div>
 			</div>
 		`;
@@ -2454,7 +2478,7 @@
 		ui.wrongColorPriority.checked = !!settings.prioritizeIncorrectColors;
 		panel.classList.toggle("gpc-min", !!settings.minimized);
 		ui.min.textContent = settings.minimized ? "+" : "-";
-		ui.min.title = settings.minimized ? "Expandir" : "Minimize";
+		ui.min.title = settings.minimized ? "Développer" : "Réduire";
 		if (Number.isFinite(settings.panelLeft) && Number.isFinite(settings.panelTop)) {
 			panel.style.left = settings.panelLeft + "px";
 			panel.style.top = settings.panelTop + "px";
@@ -2476,7 +2500,7 @@
 		ui.smartPriority.addEventListener("change", () => {
 			settings.smartPriority = ui.smartPriority.checked;
 			applyFiltersChanged();
-			setStatus("idle", settings.smartPriority ? "Prioridade inteligente ativada." : "Prioridade inteligente desativada.");
+			setStatus("idle", settings.smartPriority ? "Priorité intelligente activée." : "Priorité intelligente désactivée.");
 		});
 		ui.wrongColorPriority.addEventListener("change", () => {
 			settings.prioritizeIncorrectColors = ui.wrongColorPriority.checked;
@@ -2485,14 +2509,14 @@
 			setStatus(
 				"idle",
 				settings.prioritizeIncorrectColors
-					? "Cores incorretas serao corrigidas primeiro."
-					: "Ordem normal de pixels restaurada."
+					? "Les couleurs incorrectes seront corrigées en priorité."
+					: "Ordre normal de peinture rétabli."
 			);
 		});
 		ui.ignoreAdd.addEventListener("click", () => {
 			const ids = parseColorList(ui.ignoreInput.value);
 			if (!ids.length) {
-				setStatus("idle", "Nenhuma cor valida encontrada.");
+				setStatus("idle", "Aucune couleur valide trouvée.");
 				return;
 			}
 			const next = new Set(settings.ignoredColors);
@@ -2500,12 +2524,12 @@
 			settings.ignoredColors = [...next];
 			ui.ignoreInput.value = "";
 			applyFiltersChanged();
-			setStatus("idle", settings.ignoredColors.length + " cor(es) excluida(s).");
+			setStatus("idle", settings.ignoredColors.length + " couleur(s) exclue(s).");
 		});
 		ui.ignoreClear.addEventListener("click", () => {
 			settings.ignoredColors = [];
 			applyFiltersChanged();
-			setStatus("idle", "Exclusao de cores limpa.");
+			setStatus("idle", "Liste des couleurs exclues effacée.");
 		});
 		ui.ignoreInput.addEventListener("keydown", (event) => {
 			if (event.key === "Enter") ui.ignoreAdd.click();
@@ -2513,7 +2537,7 @@
 		ui.priorityAdd.addEventListener("click", () => {
 			const ids = parseColorList(ui.priorityInput.value);
 			if (!ids.length) {
-				setStatus("idle", "Nenhuma cor valida encontrada.");
+				setStatus("idle", "Aucune couleur valide trouvée.");
 				return;
 			}
 			const next = new Set(settings.priorityColors);
@@ -2521,12 +2545,12 @@
 			settings.priorityColors = [...next];
 			ui.priorityInput.value = "";
 			applyFiltersChanged();
-			setStatus("idle", settings.priorityColors.length + " cor(es) prioritaria(s).");
+			setStatus("idle", settings.priorityColors.length + " couleur(s) prioritaire(s).");
 		});
 		ui.priorityClear.addEventListener("click", () => {
 			settings.priorityColors = [];
 			applyFiltersChanged();
-			setStatus("idle", "Prioridade de cores limpa.");
+			setStatus("idle", "Liste des couleurs prioritaires effacée.");
 		});
 		ui.priorityInput.addEventListener("keydown", (event) => {
 			if (event.key === "Enter") ui.priorityAdd.click();
@@ -2542,33 +2566,33 @@
 		ui.areaSelect.addEventListener("click", async () => {
 			installPageBridge();
 			if (typeof win.__gpcSelectArea !== "function") {
-				setStatus("error", "O seletor do mapa ainda nao esta disponivel.");
+				setStatus("error", "La sélection sur la carte est momentanément indisponible.");
 				return;
 			}
 			ui.areaSelect.disabled = true;
-			ui.areaSelect.textContent = "Clique em 2 cantos...";
-			setStatus("syncing", "Clique em dois cantos no mapa. Pressione Esc para cancelar.");
+			ui.areaSelect.textContent = "Choisissez deux coins…";
+			setStatus("syncing", "Cliquez sur deux coins de la zone sur la carte. Appuyez sur Échap pour annuler.");
 			try {
 				const points = await win.__gpcSelectArea();
-				if (!points || points.length < 2) throw new Error("Selecao incompleta.");
+				if (!points || points.length < 2) throw new Error("Sélection incomplète.");
 				ui.areaX1.value = points[0].x;
 				ui.areaY1.value = points[0].y;
 				ui.areaX2.value = points[1].x;
 				ui.areaY2.value = points[1].y;
 				addArea(areaFromInputs());
 			} catch (error) {
-				setStatus("idle", error && error.message ? error.message : "Selecao cancelada.");
+				setStatus("idle", error && error.message ? error.message : "Sélection annulée.");
 			} finally {
 				ui.areaSelect.disabled = false;
-				ui.areaSelect.textContent = "Selecionar no mapa";
+				ui.areaSelect.textContent = "Sélectionner sur la carte";
 			}
 		});
 		ui.areaClear.addEventListener("click", () => {
 			if (!settings.areas.length) return;
-			if (!win.confirm("Remover todas as areas de pintura?")) return;
+			if (!win.confirm("Effacer toutes les zones de peinture ?")) return;
 			settings.areas = [];
 			applyFiltersChanged();
-			setStatus("idle", "Todas as areas foram removidas.");
+			setStatus("idle", "Toutes les zones ont été effacées.");
 		});
 		ui.buyColors.addEventListener("click", async () => {
 			ui.buyColors.disabled = true;
@@ -2597,7 +2621,7 @@
 			settings.minimized = !settings.minimized;
 			panel.classList.toggle("gpc-min", settings.minimized);
 			ui.min.textContent = settings.minimized ? "+" : "-";
-			ui.min.title = settings.minimized ? "Expandir" : "Minimize";
+			ui.min.title = settings.minimized ? "Développer" : "Réduire";
 			requestAnimationFrame(() => clampPanelToViewport(true));
 			saveSettings();
 		});
@@ -2608,7 +2632,7 @@
 		renderIgnoredColors();
 		renderPriorityColors();
 		renderAreas();
-		setStatus("idle", "Pronto");
+		setStatus("idle", "Prêt");
 		setButtons();
 		updateProgress();
 	}
@@ -2752,5 +2776,5 @@
 		mountUI();
 	}
 
-	log("log", "loaded", VERSION);
+	log("log", "chargé", VERSION);
 })();
