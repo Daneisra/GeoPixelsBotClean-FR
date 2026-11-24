@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GhostPixel Bot Clean
 // @namespace    https://github.com/Fox3225/GeoPixelsBotClean
-// @version      1.1.13
+// @version      1.1.14
 // @description  Script GeoPixels pour peindre des images fantômes, synchroniser la progression, recevoir une notification de fin, gérer les priorités de couleurs, acheter les couleurs manquantes et augmenter la capacité d’énergie.
 // @author       Fox3225 + Codex
 // @match        https://geopixels.net/*
@@ -22,18 +22,23 @@
 	"use strict";
 
 	const win = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
-	const VERSION = "1.1.13";
+	const VERSION = "1.1.14";
 	const ACCOUNT_MONITOR_URL = "http://127.0.0.1:47631/connect";
 	const TILE_SIZE = 1000;
 	const TILE_BATCH_SIZE = 9;
 	const WORK_CHUNK = 32768;
 	const BOARD_REFRESH_MS = 30000;
+	const DEFAULT_MAINTENANCE_INTERVAL = 30;
+	const MIN_MAINTENANCE_INTERVAL = 10;
+	const MAX_MAINTENANCE_INTERVAL = 3600;
+	const MAINTENANCE_SAMPLE_SIZE = 5;
 	const UNKNOWN_COLOR = -2;
 	const PIXEL_UNKNOWN = 0;
 	const PIXEL_CORRECT = 1;
 	const PIXEL_WRONG = 2;
 	const PIXEL_EMPTY = 3;
 	const numberFormat = new Intl.NumberFormat("fr-FR");
+	const checkTimeFormat = new Intl.DateTimeFormat("fr-FR", { dateStyle: "short", timeStyle: "medium" });
 	const MAX_PIXELS_PER_REQUEST = 5000;
 	const REQUEST_PAUSE_MS = 1200;
 	const EMPTY_ENERGY_PAUSE_MIN_MS = 15000;
@@ -71,6 +76,7 @@
 		idle: "Prêt",
 		syncing: "Synchronisation",
 		running: "Peinture",
+		watching: "Surveillance",
 		waiting: "En attente",
 		buying: "Achat",
 		done: "Terminé",
@@ -96,6 +102,10 @@
 		energy: null,
 		salvoPhase: "start",
 		nextBatchSize: 0,
+		rechargePending: false,
+		monitoring: false,
+		maintenanceStatus: "Inactive",
+		maintenanceCheck: null,
 		status: "idle",
 		message: "Prêt",
 	};
@@ -614,6 +624,9 @@
 	function loadSettings() {
 		const fallback = {
 			...DEFAULT_ENERGY_SETTINGS,
+			workMode: "construction",
+			maintenanceInterval: DEFAULT_MAINTENANCE_INTERVAL,
+			autoMaintenance: false,
 			automaticPurchases: normalizeAutomaticPurchases(),
 			includeFreeColors: true,
 			includeTransparent: false,
@@ -629,6 +642,9 @@
 		try {
 			const loaded = { ...fallback, ...JSON.parse(storageGet(SETTINGS_KEY) || "{}") };
 			Object.assign(loaded, normalizeEnergySettings(loaded));
+			loaded.workMode = loaded.workMode === "maintenance" ? "maintenance" : "construction";
+			loaded.maintenanceInterval = normalizeMaintenanceInterval(loaded.maintenanceInterval);
+			loaded.autoMaintenance = loaded.autoMaintenance === true;
 			loaded.automaticPurchases = normalizeAutomaticPurchases(loaded.automaticPurchases);
 			loaded.ignoredColors = Array.isArray(loaded.ignoredColors)
 				? loaded.ignoredColors.map(toColorId).filter((id) => id !== null)
@@ -645,6 +661,12 @@
 		} catch {
 			return fallback;
 		}
+	}
+
+	function normalizeMaintenanceInterval(value) {
+		return Math.max(MIN_MAINTENANCE_INTERVAL, clampPositiveInt(
+			value, DEFAULT_MAINTENANCE_INTERVAL, MAX_MAINTENANCE_INTERVAL
+		));
 	}
 
 	function normalizeEnergySettings(values) {
@@ -700,11 +722,6 @@
 			}
 		} catch {}
 		return undefined;
-	}
-
-	function readNumberGlobal(name) {
-		const value = Number(readGlobal(name));
-		return Number.isFinite(value) ? value : null;
 	}
 
 	function normalizeUserId(value) {
@@ -1495,6 +1512,7 @@
 
 	function countPixel(cache, rank, color, classification, change) {
 		cache.counts[classification] += change;
+		if (cache.monitor) return;
 		if (classification !== PIXEL_WRONG && classification !== PIXEL_EMPTY) return;
 		if (cache.missingByColor) {
 			const count = (cache.missingByColor.get(color) ?? 0) + change;
@@ -1531,10 +1549,12 @@
 
 		const model = modelCache;
 		const filter = settings;
-		const owned = options.owned || getOwnedColorIds();
-		const key = settingsSignature() + "|" + (owned ? [...owned].sort((a, b) => a - b).join(",") : "?");
+		const owned = options.monitor ? null : options.owned || getOwnedColorIds();
+		const paletteKey = owned ? [...owned].sort((a, b) => a - b).join(",") : "?";
+		const key = settingsSignature() + "|" + (options.monitor ? "monitor" : paletteKey);
 		const existing = options.onlyUnowned ? purchaseTargetCache : targetCache;
 		if (existing?.model === model && existing.key === key) return existing;
+		const orderTargets = !options.onlyUnowned && !options.monitor;
 
 		const { colors, width, gridX, gridY } = model;
 		const ignored = new Set(filter.ignoredColors);
@@ -1574,12 +1594,12 @@
 				}
 				unordered[count++] = index;
 				ranks[index] = 1;
-				if (!options.onlyUnowned) frequencies.set(color, (frequencies.get(color) ?? 0) + 1);
+				if (orderTargets) frequencies.set(color, (frequencies.get(color) ?? 0) + 1);
 			}
 		}
 
 		let indices = count === unordered.length ? unordered : unordered.slice(0, count);
-		if (!options.onlyUnowned && count > 1) {
+		if (orderTargets && count > 1) {
 			// Départage par rareté, puis taille de région, puis priorité manuelle. Les égalités restent dans l’ordre du modèle.
 			let scratch = new Uint32Array(count);
 			const keys = new Uint32Array(colors.length);
@@ -1610,8 +1630,9 @@
 		const cache = {
 			model, key, indices, ranks: count ? ranks : new Uint32Array(0),
 			tiles: [...activeTiles], counts: [0, 0, 0, 0],
-			pending: new Uint32Array(options.onlyUnowned ? 0 : words),
-			wrong: new Uint32Array(options.onlyUnowned ? 0 : words),
+			monitor: options.monitor === true,
+			pending: new Uint32Array(orderTargets ? words : 0),
+			wrong: new Uint32Array(orderTargets ? words : 0),
 			firstPending: words, firstWrong: words,
 			missingByColor: options.onlyUnowned ? new Map() : null,
 		};
@@ -2085,9 +2106,10 @@
 		return ctx.getImageData(0, 0, TILE_SIZE, TILE_SIZE);
 	}
 
-	function recordObservation(model, tile, index, color) {
+	function recordObservation(model, tile, index, color, onChange) {
 		const previous = model.observed[index];
 		if (previous === color) return;
+		if (onChange && previous !== UNKNOWN_COLOR) onChange(index, previous, color);
 		model.observed[index] = color;
 		tile.unknown += (color === UNKNOWN_COLOR ? 1 : 0) - (previous === UNKNOWN_COLOR ? 1 : 0);
 		const expected = model.colors[index];
@@ -2106,7 +2128,7 @@
 		}
 	}
 
-	async function readFullTilePixels(model, tile, imageData) {
+	async function readFullTilePixels(model, tile, imageData, onChange) {
 		const { data } = imageData;
 		if (data.length !== TILE_SIZE * TILE_SIZE * 4) throw new Error("Dimensions de tuile GeoPixels invalides.");
 		const { left, right, top, bottom } = tile;
@@ -2117,7 +2139,7 @@
 				model.gridX + left - tile.x) * 4;
 			for (let col = left; col < right; col++, index++, offset += 4) {
 				recordObservation(model, tile, index, data[offset + 3] === 0 ? -1 :
-					(data[offset] << 16) | (data[offset + 1] << 8) | data[offset + 2]);
+					(data[offset] << 16) | (data[offset + 1] << 8) | data[offset + 2], onChange);
 			}
 			budget -= right - left;
 			if (budget <= 0) {
@@ -2136,13 +2158,18 @@
 				Tiles: tiles.map(({ x, y, timestamp, unknown }) => ({ x, y, timestamp: unknown ? 0 : timestamp })),
 			}),
 		});
-		if (!response.ok) throw new Error("Échec du chargement des tuiles (HTTP " + response.status + ").");
+		if (!response.ok) {
+			const error = new Error("Échec du chargement des tuiles (HTTP " + response.status + ").");
+			if (response.status === 429) error.retryDelay = rateLimitDelay(response.headers.get("Retry-After"));
+			throw error;
+		}
 		return response.json();
 	}
 
 	async function syncBoard(options = {}, cache) {
 		cache ??= await buildTargets(options);
 		const { model, tiles } = cache;
+		const { onChange } = options;
 		if (tiles.length && !options.silent) setStatus("syncing", "Synchronisation de " + tiles.length + " tuile(s)…");
 		for (const group of chunk(tiles, TILE_BATCH_SIZE)) {
 			if (state.stopRequested) return cache;
@@ -2170,10 +2197,10 @@
 						if (typeof rawColor === "number" && !Number.isInteger(rawColor)) continue;
 						const color = toColorId(rawColor);
 						if (color === null || color < -1 || color > 0xFFFFFF) continue;
-						recordObservation(model, tile, row * model.width + col, color);
+						recordObservation(model, tile, row * model.width + col, color, onChange);
 					}
 				} else if (response?.Type === "full" && response.ColorWebP) {
-					await readFullTilePixels(model, tile, await webpToImageData(response.ColorWebP));
+					await readFullTilePixels(model, tile, await webpToImageData(response.ColorWebP), onChange);
 				} else {
 					continue;
 				}
@@ -2227,14 +2254,18 @@
 
 
 	function readEnergy() {
-		if (state.energy) return state.energy;
-		const capacity = Math.floor(readNumberGlobal("maxEnergy"));
-		const current = readNumberGlobal("currentEnergy");
-		return {
-			current: current === null ? null : Math.max(0, Math.floor(current)),
-			capacity: capacity > 0 ? capacity : null,
-			rate: readNumberGlobal("energyRate"),
-		};
+		return state.energy ?? { current: null, capacity: null };
+	}
+
+	async function loadInitialEnergy() {
+		const auth = getAuthPayload();
+		if (!auth.token || !Number.isFinite(auth.userId)) return;
+		const previous = state.energy;
+		const { energy } = await fetchEnergySnapshot();
+		if (state.energy === previous && energy && getAuthPayload().userId === auth.userId) {
+			state.energy = energy;
+			updateEnergyDisplay();
+		}
 	}
 
 	function getEnergyThreshold(capacity) {
@@ -2274,7 +2305,7 @@
 
 	function observedPaintRate() {
 		const elapsed = (Date.now() - state.runStartedAt) / 1000;
-		return state.running && state.paintedGroups >= 2 && elapsed >= 2 ? state.placedThisRun / elapsed : 0;
+		return state.running && !state.monitoring && state.paintedGroups >= 2 && elapsed >= 2 ? state.placedThisRun / elapsed : 0;
 	}
 
 	async function sendPixelBatch(targets, cache) {
@@ -2364,7 +2395,10 @@
 
 	async function startBot() {
 		if (state.running || state.syncing) return;
+		return settings.workMode === "maintenance" ? startMaintenance() : startConstruction();
+	}
 
+	async function startConstruction() {
 		prepareCompletionNotifications();
 		completionNotificationSent = false;
 		hadPendingTargets = false;
@@ -2376,10 +2410,12 @@
 		state.runNumber++;
 		state.salvoPhase = "start";
 		state.nextBatchSize = 0;
+		state.rechargePending = false;
 		const salvos = settings.energyMode === "salvos";
 		const limit = settings.maxBatchSize || MAX_PIXELS_PER_REQUEST;
 		let salvoRemaining = 0;
 		let refreshBoardBeforeSend = false;
+		let completed = false;
 		const automaticColors = settings.automaticPurchases.accountId !== null &&
 			settings.automaticPurchases.policy !== "off" &&
 			settings.automaticPurchases.enabled.includes("ExtraColor");
@@ -2419,6 +2455,7 @@
 					}
 					setStatus("done", automaticColors ? "Aucun pixel accessible à peindre dans la sélection."
 						: "Tous les pixels sélectionnés sont déjà corrects.");
+					completed = true;
 					notifyCompletion();
 					break;
 				}
@@ -2430,6 +2467,7 @@
 				const reading = automatic?.reading ?? await fetchEnergySnapshot();
 				if (state.stopRequested) break;
 				state.nextBatchSize = 0;
+				state.rechargePending = false;
 				if (reading.status === 401 || reading.status === 403) {
 					setStatus("error", "Lecture de l’énergie refusée. Vérifiez votre session GeoPixels.");
 					break;
@@ -2460,11 +2498,12 @@
 				const threshold = waitingForSalvo ? getEnergyThreshold(energy.capacity) : settings.energyReserve + 1;
 				if (threshold === null || energy.current < threshold) {
 					const exceedsCapacity = energy.capacity !== null && threshold > energy.capacity;
+					state.rechargePending = threshold !== null && !exceedsCapacity;
 					setStatus("waiting", threshold === null
 						? "Capacité maximale indisponible. Nouvelle lecture en attente…"
 						: exceedsCapacity
 							? "Seuil attendu supérieur à la capacité. Vérifiez le seuil et la réserve."
-							: "Recharge en cours…");
+							: "Le prochain groupe attend la recharge de l’énergie.");
 					updateEnergyDisplay();
 					refreshBoardBeforeSend = true;
 					const energyDelay = energyPollDelay(energy, threshold ?? 0);
@@ -2500,9 +2539,10 @@
 					log("warn", "Échec de l’envoi des pixels", result.status, result.text);
 					if (result.status === 403 && /not enough energy/i.test(result.text || "")) {
 						state.energy = { ...energy, current: null };
+						state.rechargePending = true;
 						if (salvos) state.salvoPhase = "resume";
 						salvoRemaining = 0;
-						setStatus("waiting", "Énergie insuffisante. Recharge en cours…");
+						setStatus("waiting", "Énergie insuffisante. Le prochain groupe attend la recharge.");
 						updateEnergyDisplay();
 						refreshBoardBeforeSend = true;
 						const resumeThreshold = salvos ? getEnergyThreshold(energy.capacity) : settings.energyReserve + 1;
@@ -2550,6 +2590,7 @@
 				}
 				if (state.remaining === 0 && !automaticColors) {
 					setStatus("done", "Tous les pixels sélectionnés ont été envoyés.");
+					completed = true;
 					notifyCompletion();
 					break;
 				}
@@ -2567,10 +2608,112 @@
 					: error?.message || "La peinture a été interrompue.");
 			}
 		} finally {
+			if (state.stopRequested) completed = false;
 			state.running = false;
 			state.stopRequested = false;
 			state.salvoPhase = "start";
 			state.nextBatchSize = 0;
+			state.rechargePending = false;
+			setButtons();
+			updateProgress();
+		}
+		if (completed && settings.autoMaintenance) return startMaintenance(true);
+	}
+
+	function trackMaintenanceChanges(cache) {
+		const report = { changedCount: 0, samples: [] };
+		let seen;
+		const { model, ranks } = cache;
+		const observe = (index, previous, current) => {
+			if (!ranks[index]) return;
+			const rank = ranks[index] - 1;
+			seen ??= new Uint8Array(Math.ceil(cache.indices.length / 8));
+			const byte = rank >>> 3;
+			const bit = 1 << (rank & 7);
+			if (seen[byte] & bit) {
+				const sample = report.samples.find((item) => item.index === index);
+				if (sample) sample.current = current;
+				return;
+			}
+			seen[byte] |= bit;
+			report.changedCount++;
+			if (report.samples.length < MAINTENANCE_SAMPLE_SIZE) {
+				report.samples.push({
+					index, previous, current,
+					x: model.gridX + index % model.width,
+					y: model.gridY - Math.floor(index / model.width),
+				});
+			}
+		};
+		return { report, observe };
+	}
+
+	async function startMaintenance(afterConstruction = false) {
+		state.running = true;
+		state.monitoring = true;
+		state.stopRequested = false;
+		state.maintenanceCheck = null;
+		let previousCache = null;
+		let changes = null;
+		setButtons();
+		updateProgress();
+		try {
+			while (!state.stopRequested) {
+				let sleepMs = settings.maintenanceInterval * 1000;
+				state.maintenanceStatus = "Vérification…";
+				renderMaintenance();
+				try {
+					const cache = await buildTargets({ monitor: true });
+					if (cache !== previousCache) changes = null;
+					await syncBoard({ silent: true, onChange: changes?.observe }, cache);
+					if (state.stopRequested) break;
+					if (targetCache !== cache || !sameGhost(cache.model, getGhostSource())) continue;
+
+					const unknown = cache.counts[PIXEL_UNKNOWN];
+					if (afterConstruction) {
+						if (!cache.indices.length || cache.counts[PIXEL_CORRECT] !== cache.indices.length) {
+							setStatus("waiting", "Surveillance automatique reportée. Le modèle sélectionné reste incomplet ou partiellement observé.");
+							break;
+						}
+						settings.workMode = "maintenance";
+						saveSettings();
+						if (ui.workMode) ui.workMode.value = settings.workMode;
+						afterConstruction = false;
+					}
+
+					const report = changes?.report ?? { changedCount: 0, samples: [] };
+					state.maintenanceCheck = { ...report, at: Date.now() };
+					previousCache = cache;
+					changes = trackMaintenanceChanges(cache);
+					if (!cache.indices.length) {
+						state.maintenanceStatus = "En attente d’une sélection";
+						setStatus("waiting", "Aucun pixel sélectionné à surveiller.");
+					} else {
+						state.maintenanceStatus = unknown ? "Partielle" : "Active";
+						setStatus("watching", report.changedCount ? "Des modifications ont été détectées sur le modèle."
+							: unknown ? "Certains pixels du modèle sont encore non observés." : "Surveillance en cours.");
+					}
+					updateProgress();
+				} catch (error) {
+					if (state.stopRequested) break;
+					log("warn", "Vérification de maintenance interrompue.", error);
+					const retryDelay = error?.retryDelay ?? 0;
+					state.maintenanceStatus = "Vérification interrompue";
+					setStatus("waiting", error?.message || "Impossible de vérifier le modèle.");
+					if (afterConstruction || retryDelay > 2147483647) return;
+					sleepMs = Math.max(sleepMs, retryDelay);
+					renderMaintenance();
+				}
+				await wait(sleepMs);
+			}
+		} finally {
+			const stopped = state.stopRequested;
+			state.running = false;
+			state.monitoring = false;
+			state.stopRequested = false;
+			if (stopped) setStatus("stopped", "Surveillance arrêtée.");
+			state.maintenanceStatus = stopped ? "Arrêtée" :
+				state.maintenanceStatus === "Vérification interrompue" ? state.maintenanceStatus : "Inactive";
 			setButtons();
 			updateProgress();
 		}
@@ -2581,7 +2724,7 @@
 		state.syncing = true;
 		setButtons();
 		try {
-			await syncBoard();
+			await syncBoard({ monitor: settings.workMode === "maintenance" });
 			const reading = await fetchEnergySnapshot();
 			if (reading.energy) state.energy = reading.energy;
 			const balance = automaticBalance(reading.data);
@@ -2620,6 +2763,8 @@
 		if (ui.buyCapacity) ui.buyCapacity.disabled = state.running;
 		if (ui.energyControls) ui.energyControls.disabled = state.running;
 		if (ui.autoControls) ui.autoControls.disabled = state.running;
+		if (ui.workMode) ui.workMode.disabled = state.running || state.syncing;
+		if (ui.maintenanceControls) ui.maintenanceControls.disabled = state.running;
 	}
 
 	function updateEnergyDisplay() {
@@ -2627,10 +2772,26 @@
 		const { current, capacity } = readEnergy();
 		const salvos = settings.energyMode === "salvos";
 		const threshold = salvos && state.salvoPhase !== "active" ? getEnergyThreshold(capacity) : null;
-		ui.energyText.textContent = (current ?? "—") + " / " + (capacity ?? "—");
+		ui.energyText.textContent = current !== null && capacity !== null
+			? numberFormat.format(current) + " / " + numberFormat.format(capacity)
+			: "Chargement…";
 		ui.salvoState.textContent = salvos ? SALVO_LABELS[state.salvoPhase] : "Mode continu";
 		ui.energyThreshold.textContent = threshold ?? "—";
-		ui.nextBatchSize.textContent = state.running ? state.nextBatchSize : "—";
+		ui.nextBatchSize.textContent = state.rechargePending ? "En attente de recharge"
+			: state.running && !state.monitoring ? state.nextBatchSize : "—";
+	}
+
+	function renderMaintenance() {
+		if (!ui.maintenanceStatus) return;
+		const check = state.maintenanceCheck;
+		ui.maintenanceStatus.textContent = state.maintenanceStatus;
+		ui.maintenanceChanged.textContent = check ? numberFormat.format(check.changedCount) : "—";
+		ui.maintenanceTime.textContent = check ? checkTimeFormat.format(check.at) : "—";
+		ui.maintenanceTime.dateTime = check ? new Date(check.at).toISOString() : "";
+		ui.maintenanceSamples.textContent = (check?.samples ?? []).map(({ x, y, previous, current }) =>
+			x + ", " + y + " · " + (previous === -1 ? "vide" : colorHex(previous)) + " → " +
+			(current === -1 ? "vide" : colorHex(current))
+		).join("\n");
 	}
 
 	function bindEnergySettings() {
@@ -2777,6 +2938,7 @@
 		if (ui.unknownText) ui.unknownText.textContent = numberFormat.format(unknown);
 		if (ui.emptyText) ui.emptyText.textContent = numberFormat.format(empty);
 		updateEnergyDisplay();
+		renderMaintenance();
 		const rate = observedPaintRate();
 		if (ui.etaText) ui.etaText.textContent = rate && remaining && !unknown ? formatDuration(remaining / rate) : "—";
 		if (ui.rateText) ui.rateText.textContent = rate ? numberFormat.format(rate * 60) + " px/min" : "—";
@@ -2951,6 +3113,8 @@
 			#gpc-body { min-height: 0; padding: 0 11px 11px; overflow-y: auto; overscroll-behavior: contain; }
 			#gpc-toolbar { flex: 0 0 auto; padding: 8px 11px; border-bottom: 1px solid #253044; }
 			#gpc-toolbar .gpc-row { flex-wrap: wrap; }
+			.gpc-activity { display: flex; align-items: center; gap: 7px; margin-bottom: 7px; }
+			.gpc-activity select { flex: 1; }
 			#gpc-panel.gpc-min #gpc-toolbar, #gpc-panel.gpc-min #gpc-body { display: none; }
 			#gpc-panel.gpc-min { width: min(206px, calc(100vw - 16px)); }
 			.gpc-row { display: flex; gap: 7px; align-items: center; }
@@ -3033,6 +3197,8 @@
 			.gpc-energy-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
 			.gpc-energy-grid label { min-width: 0; display: grid; gap: 3px; }
 			.gpc-energy-summary { display: flex; flex-wrap: wrap; gap: 2px 9px; margin-bottom: 6px; }
+			#gpc-maintenance-controls { min-width: 0; padding: 0; border: 0; margin: 0; }
+			#gpc-maintenance-samples { white-space: pre-line; margin: 0 0 4px; overflow-wrap: anywhere; }
 			.gpc-auto-summary { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 8px; margin: 7px 0; }
 			.gpc-auto-summary dd { margin: 0; overflow-wrap: anywhere; }
 			.gpc-auto-order { display: flex; flex-direction: column; gap: 4px; margin: 7px 0; }
@@ -3133,6 +3299,12 @@
 				</div>
 			</div>
 			<div id="gpc-toolbar">
+				<label class="gpc-activity">Mode
+					<select id="gpc-work-mode" class="gpc-input">
+						<option value="construction">Construction</option>
+						<option value="maintenance">Maintenance</option>
+					</select>
+				</label>
 				<div class="gpc-row">
 					<button id="gpc-start" class="gpc-btn gpc-primary gpc-grow" type="button">Démarrer</button>
 					<button id="gpc-stop" class="gpc-btn gpc-danger gpc-grow" type="button">Arrêter</button>
@@ -3145,7 +3317,7 @@
 				<div class="gpc-stats">
 					<div class="gpc-stat gpc-stat-total"><b>Confirmés / sélectionnés</b><span id="gpc-count">0 / 0</span></div>
 					<div class="gpc-stat"><b>Restants</b><span id="gpc-left">0</span></div>
-					<div class="gpc-stat"><b>Énergie</b><span id="gpc-energy">— / —</span></div>
+					<div class="gpc-stat"><b>Énergie</b><span id="gpc-energy">Chargement…</span></div>
 					<div class="gpc-stat"><b>Temps estimé</b><span id="gpc-eta">—</span></div>
 					<div class="gpc-stat"><b>Débit observé</b><span id="gpc-rate">—</span></div>
 				</div>
@@ -3159,6 +3331,23 @@
 					<span>Seuil attendu <b id="gpc-energy-threshold"></b></span>
 					<span>Prochain groupe <b id="gpc-next-batch"></b></span>
 				</div>
+				<div class="gpc-energy-summary gpc-muted">
+					<span>Surveillance <b id="gpc-maintenance-status">Inactive</b></span>
+					<span>Pixels modifiés <b id="gpc-maintenance-changed">—</b></span>
+					<span>Dernière vérification <time id="gpc-maintenance-time">—</time></span>
+				</div>
+				<details class="gpc-section">
+					<summary>Surveillance du modèle</summary>
+					<div id="gpc-maintenance-samples" class="gpc-muted"></div>
+					<fieldset id="gpc-maintenance-controls" aria-label="Réglages de la surveillance">
+						<label>Intervalle de vérification (s)
+							<input id="gpc-maintenance-interval" class="gpc-input" type="number" min="${MIN_MAINTENANCE_INTERVAL}" max="${MAX_MAINTENANCE_INTERVAL}" step="1">
+						</label>
+						<label class="gpc-check">
+							<input id="gpc-maintenance-auto" type="checkbox"> Surveiller automatiquement après la construction
+						</label>
+					</fieldset>
+				</details>
 				<details class="gpc-section">
 					<summary>Réglages de l’énergie</summary>
 					<fieldset id="gpc-energy-controls" class="gpc-energy-grid" aria-label="Réglages de l’énergie">
@@ -3324,6 +3513,12 @@
 		ui.salvoState = panel.querySelector("#gpc-salvo-state");
 		ui.energyThreshold = panel.querySelector("#gpc-energy-threshold");
 		ui.nextBatchSize = panel.querySelector("#gpc-next-batch");
+		ui.workMode = panel.querySelector("#gpc-work-mode");
+		ui.maintenanceControls = panel.querySelector("#gpc-maintenance-controls");
+		ui.maintenanceStatus = panel.querySelector("#gpc-maintenance-status");
+		ui.maintenanceChanged = panel.querySelector("#gpc-maintenance-changed");
+		ui.maintenanceTime = panel.querySelector("#gpc-maintenance-time");
+		ui.maintenanceSamples = panel.querySelector("#gpc-maintenance-samples");
 		ui.autoControls = panel.querySelector("#gpc-auto-controls");
 		ui.autoBalance = panel.querySelector("#gpc-auto-balance");
 		ui.autoSpent = panel.querySelector("#gpc-auto-spent");
@@ -3361,6 +3556,24 @@
 		ui.wrongColorPriority.checked = !!settings.prioritizeIncorrectColors;
 		bindEnergySettings();
 		bindAutomaticPurchases();
+		const maintenanceInterval = panel.querySelector("#gpc-maintenance-interval");
+		const autoMaintenance = panel.querySelector("#gpc-maintenance-auto");
+		ui.workMode.value = settings.workMode;
+		maintenanceInterval.value = settings.maintenanceInterval;
+		autoMaintenance.checked = settings.autoMaintenance;
+		ui.workMode.addEventListener("change", () => {
+			settings.workMode = ui.workMode.value;
+			saveSettings();
+		});
+		maintenanceInterval.addEventListener("change", () => {
+			settings.maintenanceInterval = normalizeMaintenanceInterval(maintenanceInterval.value);
+			maintenanceInterval.value = settings.maintenanceInterval;
+			saveSettings();
+		});
+		autoMaintenance.addEventListener("change", () => {
+			settings.autoMaintenance = autoMaintenance.checked;
+			saveSettings();
+		});
 		panel.classList.toggle("gpc-min", !!settings.minimized);
 		ui.min.textContent = settings.minimized ? "+" : "-";
 		ui.min.title = settings.minimized ? "Développer" : "Réduire";
@@ -3514,12 +3727,18 @@
 		enableDrag();
 		clampPanelToViewport(false);
 		window.addEventListener("resize", () => clampPanelToViewport(true));
+		window.addEventListener("focus", () => {
+			if (!state.running && !state.syncing && (!state.energy || state.energy.capacity === null)) {
+				void loadInitialEnergy();
+			}
+		});
 		renderIgnoredColors();
 		renderPriorityColors();
 		renderAreas();
 		setStatus("idle", "Prêt");
 		setButtons();
 		updateProgress();
+		void loadInitialEnergy();
 	}
 
 	function clampPanelToViewport(persist) {

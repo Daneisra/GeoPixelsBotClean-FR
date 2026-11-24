@@ -1,6 +1,6 @@
 # GeoPixelsBotClean-FR
 
-Version française de GhostPixel Bot Clean pour GeoPixels. Ce script Tampermonkey peint des images fantômes, suit leur progression et aide à gérer les couleurs et l’énergie. Les fonctions principales utilisent la session GeoPixels ouverte dans le navigateur et fonctionnent sans serveur supplémentaire.
+Version française de GhostPixel Bot Clean pour GeoPixels. La version **1.1.14** construit et surveille les images fantômes, suit leur progression et aide à gérer les couleurs et l’énergie. Le script Tampermonkey fonctionne sans serveur supplémentaire. Voir l’[historique des versions](CHANGELOG.md).
 
 ## Installation
 
@@ -11,9 +11,15 @@ Installez Tampermonkey, puis ouvrez [le script du dépôt français](https://raw
 1. Connectez-vous à GeoPixels, puis chargez et positionnez votre image fantôme.
 2. Ouvrez le panneau flottant **GhostPixel** et cliquez sur **Synchroniser** pour afficher la progression, l’énergie et le temps estimé.
 3. Choisissez les couleurs et les zones à traiter. Vous pouvez exclure des couleurs, limiter la peinture à une liste de couleurs, privilégier les détails ou corriger d’abord les pixels déjà peints dans une mauvaise couleur. Définissez les zones sur la carte ou saisissez leurs coordonnées.
-4. Cliquez sur **Démarrer**. Le script attend la recharge si nécessaire et affiche une notification à la fin.
+4. En mode **Construction**, cliquez sur **Démarrer** pour peindre. Le panneau indique si le prochain groupe attend une recharge et affiche une notification à la fin des envois.
 
 Le bouton **Acheter les couleurs manquantes** vérifie les pixels restants dans les zones sélectionnées et demande confirmation avant chaque lot de cinq couleurs au maximum. Le bouton **Augmenter la capacité d’énergie** utilise le solde de pixels disponible pour acheter des unités de capacité.
+
+### Maintenance du modèle
+
+Sélectionnez **Maintenance** puis cliquez sur **Démarrer** pour surveiller le modèle et les zones sélectionnés. Le contrôle inclut les couleurs que vous ne possédez pas. La première lecture établit la référence. Les suivantes utilisent les modifications renvoyées par GeoPixels et affichent le nombre de pixels modifiés depuis le contrôle précédent, jusqu’à cinq exemples avec leurs coordonnées, l’heure du dernier contrôle réussi et l’état de la surveillance. Le mode Maintenance ne lance ni placement ni achat automatique.
+
+Dans **Surveillance du modèle**, réglez l’intervalle entre 10 et 3 600 secondes. La valeur par défaut est de 30 secondes. Vous pouvez aussi activer **Surveiller automatiquement après la construction**. Le script bascule alors seulement après confirmation de tous les pixels sélectionnés. Le mode choisi et les réglages sont conservés. Pour arrêter la surveillance ou reprendre la construction, cliquez sur **Arrêter**, puis choisissez le mode souhaité avant de redémarrer. La surveillance s’exécute tant que l’onglet reste ouvert.
 
 ### Gestion de l’énergie
 
@@ -21,7 +27,7 @@ Dans **Réglages de l’énergie**, le mode **Salves** attend 100 % de la capaci
 
 La réserve est à zéro par défaut. La taille de groupe `0` utilise l’énergie disponible dans la salve, dans la limite de 5 000 pixels par requête. La salve dépense au plus le budget disponible à son ouverture. À la fin de ce budget, le script attend le seuil de reprise. Le mode **Continu** peint dès que de l’énergie dépasse la réserve et applique la même limite de taille de groupe.
 
-Le panneau affiche l’énergie actuelle et maximale, la phase de la salve, le seuil attendu et le nombre de pixels prévus pour le prochain groupe. Arrêtez la peinture pour modifier ces réglages. La capacité est actualisée en cours de peinture, et le script attend une lecture valide avant tout envoi. Si l’heure du serveur est indisponible, le script se limite à l’énergie déclarée dans la dernière réponse.
+Le panneau affiche **Chargement…** jusqu’à la première lecture de l’énergie actuelle et maximale du compte. Il indique ensuite la phase de la salve, le seuil attendu et le nombre de pixels prévus pour le prochain groupe ou son attente de recharge. Arrêtez la peinture pour modifier ces réglages. La capacité est actualisée en cours de peinture, et le script attend une lecture valide avant tout envoi. Si l’heure du serveur est indisponible, le script se limite à l’énergie déclarée dans la dernière réponse.
 
 Si le résultat d’un envoi est incertain, le script s’arrête. Le bouton **Démarrer** resynchronise alors la carte avant de reprendre. En cas de limitation des envois, le délai indiqué par GeoPixels est respecté avant la reprise. Utilisez un seul onglet pour peindre avec un même compte, car l’énergie est partagée entre les onglets.
 

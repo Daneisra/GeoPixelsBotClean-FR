@@ -11,7 +11,7 @@ const flush = () => new Promise(setImmediate);
 async function fixture({
 	pixels = 20, energy = 10, capacity = 10, settings = {}, bridge = true,
 	balance = 50, rate = 15, palette = [0xFFFFFF], template, ledger, allow = true,
-	templateWidth = pixels, topLeft = { x: 0, y: 0 }, decodedTiles,
+	templateWidth = pixels, topLeft = { x: 0, y: 0 }, decodedTiles, initialAccountStatus = 200,
 } = {}) {
 	const nodes = new Map();
 	const timers = new Map();
@@ -22,7 +22,7 @@ async function fixture({
 	const confirmations = [];
 	const notifications = [];
 	const painted = new Map();
-	const account = { energy, capacity, balance, colors: [...palette], paintResponses: [], purchaseResponses: [], status: 200, date: null, tick: 1, rate };
+	const account = { energy, capacity, balance, colors: [...palette], paintResponses: [], purchaseResponses: [], status: initialAccountStatus, date: null, tick: 1, rate };
 	const tariffs = { FasterRecharge: 500, EnergyCapacity: 50, Energy: 10, ExtraColor: 100 };
 	const shop = new Map([
 		["FasterRechargeInput", () => tariffs.FasterRecharge + " Pixels / -1s (cap at 15s)"],
@@ -88,6 +88,7 @@ async function fixture({
 		}
 		if (url === "/GetPixelsCached") {
 			tileReads.push(body.Tiles);
+			if (account.tileStatus) return reply(account.tileStatus, {}, { "Retry-After": account.tileRetryAfter });
 			if (account.readTiles) return reply(200, account.readTiles(body.Tiles));
 			const tiles = Object.fromEntries(body.Tiles.map(({ x, y }) => [
 				x + "_" + y,
@@ -205,7 +206,7 @@ const sizes = (session, ...expected) => assert.deepEqual(session.requests, expec
 
 test("les salves par défaut attendent la pleine capacité, y compris après une augmentation", async () => {
 	const s = await fixture({ energy: 9, pixels: 15, settings: { minimized: true } });
-	assert.equal(s.bot.version, "1.1.13");
+	assert.equal(s.bot.version, "1.1.14");
 	assert.equal(s.bot.settings().energyMode, "salvos");
 	assert.equal(s.bot.settings().minimized, true);
 	const run = s.bot.start();
@@ -225,7 +226,8 @@ test("les salves par défaut attendent la pleine capacité, y compris après une
 	s.account.energy = 1;
 	await s.advance(1200);
 	sizes(s, 12);
-	assert.equal(s.node("next-batch").textContent, 0);
+	assert.equal(s.node("next-batch").textContent, "En attente de recharge");
+	assert.match(s.node("message").textContent, /prochain groupe attend la recharge/i);
 	s.account.energy = 12;
 	await s.advance(60000);
 	await run;
@@ -720,4 +722,115 @@ test("l’estimation utilise le débit observé et affiche les durées longues e
 	assert.match(s.node("rate").textContent, /px\/min$/);
 	s.bot.stop();
 	await run;
+});
+
+test("les ressources provisoires n’apparaissent pas avant une lecture réelle de l’énergie", async () => {
+	const s = await fixture({ pixels: 1, energy: 30, capacity: 30, initialAccountStatus: 503 });
+	assert.equal(s.node("energy").textContent, "Chargement…");
+	s.account.status = 200;
+	s.account.energy = 22;
+	s.account.capacity = 45;
+	await s.bot.sync();
+	assert.equal(s.node("energy").textContent, "22 / 45");
+});
+
+test("les réglages de surveillance sont normalisés et conservés après rechargement", async () => {
+	const s = await fixture();
+	assert.equal(s.node("work-mode").value, "construction");
+	assert.equal(s.node("maintenance-interval").value, 30);
+	s.node("work-mode").value = "maintenance";
+	s.node("work-mode").events.change();
+	s.node("maintenance-interval").value = 3;
+	s.node("maintenance-interval").events.change();
+	assert.equal(s.node("maintenance-interval").value, 10);
+	s.node("maintenance-auto").checked = true;
+	s.node("maintenance-auto").events.change();
+	const reloaded = await fixture({ settings: JSON.parse(s.storage.getItem(settingsKey)) });
+	assert.equal(reloaded.node("work-mode").value, "maintenance");
+	assert.equal(reloaded.node("maintenance-interval").value, 10);
+	assert.equal(reloaded.node("maintenance-auto").checked, true);
+});
+
+test("la maintenance suit les deltas et signale chaque pixel modifié une fois, sans achat ni placement", async () => {
+	const s = await fixture({
+		pixels: 2, template: new Uint8Array([255, 255, 255, 255, 0x12, 0x34, 0x56, 255]),
+		settings: { workMode: "maintenance", maintenanceInterval: 12, automaticPurchases: automatic(["EnergyCapacity", "ExtraColor"]) },
+	});
+	let version = 0;
+	const edits = [
+		[[0, 0, 0xFFFFFF], [1, 0, 0x123456]],
+		[[0, 0, 0], [0, 0, 0x123456], [1, 0, -1]],
+		[],
+	];
+	s.account.readTiles = () => ({
+		ServerTimestamp: 20 + version, Tiles: { "0_0": { Type: "delta", Pixels: edits[version++] } },
+	});
+	const run = s.bot.start();
+	await flush();
+	assert.equal(s.node("maintenance-status").textContent, "Active");
+	assert.equal(s.node("maintenance-changed").textContent, "0");
+	assert.equal(s.node("count").textContent, "2 / 2");
+	assert.equal(s.node("work-mode").disabled, true);
+	const firstCheck = s.node("maintenance-time").dateTime;
+	await s.advance(12000);
+	assert.equal(s.node("maintenance-changed").textContent, "2");
+	assert.match(s.node("maintenance-samples").textContent, /0, 0 · #FFFFFF → #123456/);
+	assert.match(s.node("maintenance-samples").textContent, /1, 0 · #123456 → vide/);
+	assert.ok(s.node("maintenance-time").dateTime > firstCheck);
+	await s.advance(12000);
+	assert.equal(s.node("maintenance-changed").textContent, "0");
+	assert.equal(s.node("maintenance-samples").textContent, "");
+	assert.deepEqual(s.tileReads.map(([tile]) => tile.timestamp), [0, 20, 21]);
+	assert.deepEqual(s.purchases, []);
+	sizes(s);
+	s.bot.stop();
+	await run;
+	assert.equal(s.node("maintenance-status").textContent, "Arrêtée");
+	assert.equal(s.node("work-mode").disabled, false);
+});
+
+test("un refus temporaire de la carte conserve la dernière vérification et respecte Retry-After", async () => {
+	const s = await fixture({ pixels: 1, settings: { workMode: "maintenance", maintenanceInterval: 10 } });
+	const run = s.bot.start();
+	await flush();
+	const previous = s.node("maintenance-time").dateTime;
+	s.account.tileStatus = 429;
+	s.account.tileRetryAfter = "22";
+	await s.advance(10000);
+	assert.equal(s.node("maintenance-status").textContent, "Vérification interrompue");
+	assert.equal(s.node("maintenance-time").dateTime, previous);
+	delete s.account.tileStatus;
+	await s.advance(22000);
+	assert.equal(s.node("maintenance-status").textContent, "Active");
+	assert.ok(s.node("maintenance-time").dateTime > previous);
+	s.bot.stop();
+	await run;
+});
+
+test("la construction terminée bascule automatiquement en maintenance et conserve le mode", async () => {
+	const s = await fixture({ pixels: 1, settings: { autoMaintenance: true } });
+	const run = s.bot.start();
+	await flush();
+	sizes(s, 1);
+	assert.equal(s.node("maintenance-status").textContent, "Active");
+	assert.equal(s.node("work-mode").value, "maintenance");
+	assert.equal(JSON.parse(s.storage.getItem(settingsKey)).workMode, "maintenance");
+	s.painted.delete("0,0");
+	await s.advance(30000);
+	assert.equal(s.node("maintenance-changed").textContent, "1");
+	sizes(s, 1);
+	s.bot.stop();
+	await run;
+});
+
+test("un modèle incomplet en raison d’une couleur non acquise ne déclenche pas le basculement", async () => {
+	const s = await fixture({
+		pixels: 2, template: new Uint8Array([255, 255, 255, 255, 0x12, 0x34, 0x56, 255]),
+		settings: { autoMaintenance: true },
+	});
+	await s.bot.start();
+	sizes(s, 1);
+	assert.equal(s.node("work-mode").value, "construction");
+	assert.equal(s.node("maintenance-status").textContent, "Inactive");
+	assert.match(s.node("message").textContent, /surveillance automatique reportée/i);
 });
