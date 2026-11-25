@@ -67,6 +67,7 @@ async function fixture({
 				if (!nodes.has(selector)) nodes.set(selector, createElement("div"));
 				return nodes.get(selector);
 			},
+			append() {},
 			appendChild() {},
 			remove() {},
 		};
@@ -224,7 +225,7 @@ const sizes = (session, ...expected) => assert.deepEqual(session.requests, expec
 
 test("les salves par défaut attendent la pleine capacité, y compris après une augmentation", async () => {
 	const s = await fixture({ energy: 9, pixels: 15, settings: { minimized: true } });
-	assert.equal(s.bot.version, "1.1.16");
+	assert.equal(s.bot.version, "1.1.17");
 	assert.equal(s.bot.settings().energyMode, "salvos");
 	assert.equal(s.bot.settings().minimized, true);
 	const run = s.bot.start();
@@ -1141,4 +1142,164 @@ test("le tarif des achats automatiques utilise la taille normalisée d’une pal
 	await s.advance(1200);
 	await run;
 	sizes(s, 1);
+});
+
+async function gridFixture(width, height, options = {}) {
+	const pixels = width * height;
+	const s = await fixture({ pixels, templateWidth: width, energy: pixels, capacity: pixels, ...options });
+	s.account.readTiles = (tiles) => ({
+		ServerTimestamp: 1,
+		Tiles: Object.fromEntries(tiles.map(({ x: tileX, y: tileY }) => {
+			const pixelsInTile = [];
+			for (let y = Math.min(0, tileY + 999); y >= Math.max(1 - height, tileY); y--) {
+				for (let x = Math.max(0, tileX); x < Math.min(width, tileX + 1000); x++) {
+					pixelsInTile.push(s.painted.get(x + "," + y) ?? [x, y, -1]);
+				}
+			}
+			return [tileX + "_" + tileY, { Type: "delta", Pixels: pixelsInTile }];
+		})),
+	});
+	return s;
+}
+
+for (const [strategy, coordinates] of [
+	["top-down", [[0, 0], [1, 0], [2, 0], [0, -1], [1, -1], [2, -1]]],
+	["bottom-up", [[0, -1], [1, -1], [2, -1], [0, 0], [1, 0], [2, 0]]],
+	["left-right", [[0, 0], [0, -1], [1, 0], [1, -1], [2, 0], [2, -1]]],
+	["right-left", [[2, 0], [2, -1], [1, 0], [1, -1], [0, 0], [0, -1]]],
+]) {
+	test("l’ordre directionnel " + strategy + " est appliqué aux envois", async () => {
+		const s = await gridFixture(3, 2, { settings: { drawingStrategy: strategy } });
+		await s.bot.start();
+		assert.deepEqual(s.sent, [coordinates]);
+	});
+}
+
+test("les stratégies radiales utilisent le centre de la sélection", async () => {
+	const areas = [{ mode: "include", x1: 2, y1: 0, x2: 4, y2: -2 }];
+	for (const [drawingStrategy, first, last] of [
+		["center-out", [3, -1], [4, -2]], ["outside-in", [2, 0], [3, -1]],
+	]) {
+		const s = await gridFixture(5, 3, { settings: { drawingStrategy, areas } });
+		await s.bot.start();
+		assert.equal(s.sent[0].length, 9);
+		assert.deepEqual(s.sent[0][0], first);
+		assert.deepEqual(s.sent[0].at(-1), last);
+	}
+});
+
+test("les grandes distances radiales conservent leur ordre au-delà de 32 bits", async () => {
+	const width = 70001;
+	const s = await gridFixture(width, 1, {
+		energy: 4, capacity: 4, settings: { drawingStrategy: "outside-in" },
+	});
+	const run = s.bot.start();
+	await flush();
+	assert.deepEqual(s.sent, [[[0, 0], [70000, 0], [1, 0], [69999, 0]]]);
+	s.bot.stop();
+	await run;
+});
+
+test("les contours incluent les frontières de couleurs et laissent les intérieurs en dernier", async () => {
+	const template = new Uint8Array(25 * 4).fill(255);
+	template.set([0x12, 0x34, 0x56, 255], 12 * 4);
+	const s = await gridFixture(5, 5, {
+		template, palette: [0xFFFFFF, 0x123456], settings: { drawingStrategy: "contours" },
+	});
+	await s.bot.start();
+	assert.deepEqual(s.sent[0].slice(-4), [[1, -1], [3, -1], [1, -3], [3, -3]]);
+	assert.ok(s.sent[0].slice(0, -4).some(([x, y]) => x === 2 && y === -1));
+});
+
+test("le mode par couleur regroupe réellement les pixels, même à fréquence égale", async () => {
+	const template = new Uint8Array([255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255]);
+	const s = await gridFixture(4, 1, { template, palette: [0xFFFFFF, 0], settings: { drawingStrategy: "color" } });
+	await s.bot.start();
+	assert.deepEqual(s.sent, [[[1, 0], [3, 0], [0, 0], [2, 0]]]);
+});
+
+test("la stratégie respecte les priorités, les exclusions, les zones et la taille des salves", async () => {
+	const template = new Uint8Array([
+		0x12, 0x34, 0x56, 255, 0x12, 0x34, 0x56, 255, 255, 255, 255, 255,
+		255, 255, 255, 255, 0, 0, 0, 255, 0x12, 0x34, 0x56, 255,
+	]);
+	const s = await gridFixture(3, 2, {
+		template, palette: [0xFFFFFF, 0x123456, 0], energy: 3, capacity: 3,
+		settings: {
+			drawingStrategy: "left-right", maxBatchSize: 2, energyReserve: 1,
+			priorityColors: [0x123456], onlyPriorityColors: false, ignoredColors: [0],
+			areas: [{ mode: "include", x1: 1, y1: 0, x2: 2, y2: -1 }],
+		},
+	});
+	const run = s.bot.start();
+	await flush();
+	assert.deepEqual(s.sent, [[[1, 0], [2, -1]]]);
+	assert.equal(s.node("count").textContent, "2 / 3");
+	assert.equal(s.account.energy, 1);
+	s.bot.stop();
+	await run;
+});
+
+test("l’ancienne option de priorité intelligente est migrée et la stratégie aléatoire persiste", async () => {
+	const smart = await fixture({ settings: { smartPriority: true } });
+	assert.equal(smart.bot.settings().drawingStrategy, "smart");
+	const older = await gridFixture(4, 3, { settings: { smartPriority: false } });
+	assert.equal(older.bot.settings().drawingStrategy, "color");
+	const selector = older.node("drawing-strategy");
+	selector.value = "random";
+	selector.events.change();
+	const saved = JSON.parse(older.storage.getItem(settingsKey));
+	assert.equal(saved.drawingStrategy, "random");
+	assert.ok(Number.isInteger(saved.drawingSeed));
+	const reloaded = await gridFixture(4, 3, { settings: saved });
+	await older.bot.start();
+	await reloaded.bot.start();
+	assert.deepEqual(reloaded.sent, older.sent);
+	assert.equal(new Set(older.sent[0].map(([x, y]) => x + "," + y)).size, 12);
+	assert.notDeepEqual(older.sent[0], Array.from({ length: 12 }, (_, index) => [index % 4, -Math.floor(index / 4)]));
+});
+
+test("l’aperçu numéroté est rendu à l’ouverture puis seulement si la stratégie change", async () => {
+	const s = await fixture({ settings: { drawingStrategy: "top-down" } });
+	const section = s.node("drawing-section");
+	const preview = s.node("drawing-preview");
+	let markup = "";
+	let writes = 0;
+	Object.defineProperty(preview, "innerHTML", { get: () => markup, set(value) { markup = value; writes++; } });
+	assert.equal(writes, 0);
+	section.open = true;
+	section.events.toggle();
+	await flush();
+	assert.equal(writes, 1);
+	assert.deepEqual([...markup.matchAll(/>(\d+)<\/span>/g)].map((match) => Number(match[1])),
+		Array.from({ length: 25 }, (_, rank) => rank + 1));
+	section.open = false;
+	section.events.toggle();
+	section.open = true;
+	section.events.toggle();
+	await flush();
+	assert.equal(writes, 1);
+	const selector = s.node("drawing-strategy");
+	selector.value = "center-out";
+	selector.events.change();
+	await flush();
+	assert.equal(writes, 2);
+	assert.equal([...markup.matchAll(/>(\d+)<\/span>/g)][12][1], "1");
+	assert.match(s.node("drawing-description").textContent, /centre/);
+});
+
+test("changer la stratégie pendant la maintenance conserve la référence du delta", async () => {
+	const s = await fixture({ pixels: 1, settings: { workMode: "maintenance", maintenanceInterval: 10 } });
+	const run = s.bot.start();
+	await flush();
+	const selector = s.node("drawing-strategy");
+	selector.value = "outside-in";
+	selector.events.change();
+	s.painted.set("0,0", [0, 0, 0xFFFFFF]);
+	await s.advance(10000);
+	assert.equal(s.node("maintenance-changed").textContent, "1");
+	assert.equal(s.tileReads[1][0].timestamp, 1);
+	sizes(s);
+	s.bot.stop();
+	await run;
 });

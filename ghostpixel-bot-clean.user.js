@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GhostPixel Bot Clean
 // @namespace    https://github.com/Fox3225/GeoPixelsBotClean
-// @version      1.1.16
+// @version      1.1.17
 // @description  Script GeoPixels pour peindre des images fantômes, synchroniser la progression, recevoir une notification de fin, gérer les priorités de couleurs, acheter les couleurs manquantes et augmenter la capacité d’énergie.
 // @author       Fox3225 + Codex
 // @match        https://geopixels.net/*
@@ -22,7 +22,7 @@
 	"use strict";
 
 	const win = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
-	const VERSION = "1.1.16";
+	const VERSION = "1.1.17";
 	const ACCOUNT_MONITOR_URL = "http://127.0.0.1:47631/connect";
 	const TILE_SIZE = 1000;
 	const TILE_BATCH_SIZE = 9;
@@ -50,6 +50,19 @@
 	const MAX_COLOR_PURCHASES_PER_RUN = 5;
 	const ENERGY_CAPACITY_PURCHASE_CHUNK = 50;
 	const SETTINGS_KEY = "ghostpixel_clean_settings";
+	const DRAWING_STRATEGIES = {
+		"top-down": { label: "Haut vers bas", description: "Commence par la rangée du haut. Chaque rangée avance de gauche à droite." },
+		"bottom-up": { label: "Bas vers haut", description: "Commence par la rangée du bas. Chaque rangée avance de gauche à droite." },
+		"left-right": { label: "Gauche vers droite", description: "Commence par la colonne de gauche. Chaque colonne descend du haut vers le bas." },
+		"right-left": { label: "Droite vers gauche", description: "Commence par la colonne de droite. Chaque colonne descend du haut vers le bas." },
+		"center-out": { label: "Centre vers extérieur", description: "Commence près du centre du rectangle qui encadre les pixels sélectionnés." },
+		"outside-in": { label: "Extérieur vers centre", description: "Commence par les pixels les plus éloignés du centre de la sélection." },
+		"contours": { label: "Contours en priorité", description: "Traite d’abord les bordures de la sélection et les limites entre deux couleurs." },
+		"color": { label: "Par couleur", description: "Regroupe les pixels d’une même couleur, en commençant par les couleurs les moins présentes." },
+		"smart": { label: "Priorité intelligente", description: "Traite d’abord les petites régions de même couleur, puis départage selon la rareté." },
+		"random": { label: "Aléatoire", description: "Mélange l’ordre des pixels. Une sélection identique conserve le même ordre entre les sessions." },
+	};
+	const PREVIEW_COLORS = [0x64748B, 0x0F766E, 0x7C3AED];
 	const AUTO_UPGRADES = {
 		FasterRecharge: { label: "Vitesse de recharge", input: "FasterRechargeInput", tariff: /^(\d+) Pixels\s*\/\s*-1\s*s\s*\(cap at (\d+)\s*s\)$/i },
 		EnergyCapacity: { label: "Capacité énergétique", input: "EnergyCapacityInput", tariff: /^(\d+) Pixels\s*\/\s*\+5 max$/i },
@@ -118,6 +131,7 @@
 	let baseColors = null;
 	let baseColorsRequest = null;
 	let targetPreview = null;
+	let drawingPreviewKey = null;
 	let targetRevision = 0;
 	let purchaseObserverInstalled = false;
 	let originalFetch = null;
@@ -640,6 +654,8 @@
 			priorityColors: [],
 			onlyPriorityColors: false,
 			smartPriority: true,
+			drawingStrategy: "smart",
+			drawingSeed: 0,
 			prioritizeIncorrectColors: false,
 			areas: [],
 			panelLeft: null,
@@ -663,7 +679,10 @@
 			// Jusqu’à la v1.1.14, une liste de priorités limitait aussi la sélection.
 			loaded.onlyPriorityColors = stored?.onlyPriorityColors === undefined
 				? loaded.priorityColors.length > 0 : stored.onlyPriorityColors === true;
-			loaded.smartPriority = loaded.smartPriority !== false;
+			loaded.drawingStrategy = Object.hasOwn(DRAWING_STRATEGIES, stored?.drawingStrategy)
+				? stored.drawingStrategy : stored?.smartPriority === false ? "color" : "smart";
+			loaded.drawingSeed = Number.isInteger(loaded.drawingSeed) ? loaded.drawingSeed >>> 0 : 0;
+			loaded.smartPriority = loaded.drawingStrategy === "smart";
 			loaded.prioritizeIncorrectColors = loaded.prioritizeIncorrectColors === true;
 			loaded.areas = Array.isArray(loaded.areas)
 				? loaded.areas.map(normalizeArea).filter(Boolean)
@@ -1520,7 +1539,7 @@
 
 	function settingsSignature() {
 		return [
-			settings.includeFreeColors, settings.includeTransparent, settings.smartPriority, settings.onlyPriorityColors,
+			settings.includeFreeColors, settings.includeTransparent, settings.onlyPriorityColors,
 			settings.ignoredColors.join("."), settings.priorityColors.join("."),
 			settings.areas.map((area) => [area.mode, area.x1, area.y1, area.x2, area.y2].join(",")).join(";"),
 		].join("|");
@@ -1678,6 +1697,110 @@
 		return regions;
 	}
 
+	async function fillTargetKeys(indices, keys, keyOf) {
+		for (let index = 0; index < indices.length; index++) {
+			const pixel = indices[index];
+			keys[pixel] = keyOf(pixel);
+			if ((index + 1) % WORK_CHUNK === 0) await yieldWork();
+		}
+	}
+
+	async function radialTargetKeys(indices, width, keys, outsideFirst) {
+		const { floor } = Math;
+		let left = width;
+		let right = 0;
+		let top = floor(indices[0] / width);
+		let bottom = top;
+		for (let index = 0; index < indices.length; index++) {
+			const pixel = indices[index];
+			const col = pixel % width;
+			const row = floor(pixel / width);
+			if (col < left) left = col;
+			if (col > right) right = col;
+			if (row < top) top = row;
+			if (row > bottom) bottom = row;
+			if ((index + 1) % WORK_CHUNK === 0) await yieldWork();
+		}
+
+		const maxDistance = (right - left) ** 2 + (bottom - top) ** 2;
+		const highKeys = maxDistance >= 0x100000000 ? new Uint32Array(keys.length) : null;
+		// Les coordonnées doublées gardent les centres entre deux pixels sans fraction.
+		await fillTargetKeys(indices, keys, (pixel) => {
+			const dx = 2 * (pixel % width) - left - right;
+			const dy = 2 * floor(pixel / width) - top - bottom;
+			const distance = dx * dx + dy * dy;
+			const key = outsideFirst ? maxDistance - distance : distance;
+			if (highKeys) highKeys[pixel] = floor(key / 0x100000000);
+			return key;
+		});
+		return highKeys;
+	}
+
+	function contourKey(pixel, width, colors, ranks) {
+		const col = pixel % width;
+		if (col === 0 || col === width - 1 || pixel < width || pixel >= colors.length - width) return 0;
+		const color = colors[pixel];
+		return ranks[pixel - 1] && ranks[pixel + 1] && ranks[pixel - width] && ranks[pixel + width] &&
+			colors[pixel - 1] === color && colors[pixel + 1] === color &&
+			colors[pixel - width] === color && colors[pixel + width] === color ? 1 : 0;
+	}
+
+	async function orderTargetIndices(model, indices, ranks, frequencies, priority, strategy, seed) {
+		if (indices.length < 2) return indices;
+		if (strategy === "random") {
+			// Fisher–Yates par blocs, avec une graine persistante.
+			const { imul, floor } = Math;
+			let value = seed;
+			for (let index = indices.length - 1; index > 0; index--) {
+				value = (imul(value, 1664525) + 1013904223) >>> 0;
+				const other = floor(value * (index + 1) / 0x100000000);
+				const pixel = indices[index];
+				indices[index] = indices[other];
+				indices[other] = pixel;
+				if (index % WORK_CHUNK === 0) await yieldWork();
+			}
+		}
+		if ((strategy === "top-down" || strategy === "random") && !priority.size) return indices;
+
+		const { width, height, colors } = model;
+		let scratch = new Uint32Array(indices.length);
+		const keys = new Uint32Array(colors.length);
+		if (strategy === "smart") {
+			if (frequencies.size > 1) {
+				await fillTargetKeys(indices, keys, (pixel) => frequencies.get(colors[pixel]));
+				[indices, scratch] = await sortTargetKeys(indices, keys, scratch);
+			}
+			const regions = await measureRegions(model, indices, ranks);
+			[indices, scratch] = await sortTargetKeys(indices, regions, scratch);
+		} else if (strategy === "color" && frequencies.size > 1) {
+			const colorsByRarity = [...frequencies].sort(([idA, countA], [idB, countB]) => countA - countB || idA - idB);
+			const colorOrder = new Map(colorsByRarity.map(([color], rank) => [color, rank]));
+			await fillTargetKeys(indices, keys, (pixel) => colorOrder.get(colors[pixel]));
+			[indices, scratch] = await sortTargetKeys(indices, keys, scratch);
+		} else if (strategy === "center-out" || strategy === "outside-in") {
+			const highKeys = await radialTargetKeys(indices, width, keys, strategy === "outside-in");
+			[indices, scratch] = await sortTargetKeys(indices, keys, scratch);
+			if (highKeys) [indices, scratch] = await sortTargetKeys(indices, highKeys, scratch);
+		} else {
+			const spatialKey = {
+				"bottom-up": (pixel) => height - 1 - Math.floor(pixel / width),
+				"left-right": (pixel) => pixel % width,
+				"right-left": (pixel) => width - 1 - (pixel % width),
+				contours: (pixel) => contourKey(pixel, width, colors, ranks),
+			}[strategy];
+			if (spatialKey) {
+				await fillTargetKeys(indices, keys, spatialKey);
+				[indices, scratch] = await sortTargetKeys(indices, keys, scratch);
+			}
+		}
+		if (priority.size) {
+			// Le tri stable donne la priorité aux couleurs choisies tout en conservant la stratégie dans chaque groupe.
+			await fillTargetKeys(indices, keys, (pixel) => priority.get(colors[pixel]) ?? priority.size);
+			[indices] = await sortTargetKeys(indices, keys, scratch);
+		}
+		return indices;
+	}
+
 	function pixelStatus(expected, observed) {
 		if (observed === UNKNOWN_COLOR) return PIXEL_UNKNOWN;
 		if (observed === expected) return PIXEL_CORRECT;
@@ -1726,13 +1849,15 @@
 
 		const model = modelCache;
 		const filter = settings;
+		const orderTargets = !options.onlyUnowned && !options.monitor;
+		const { drawingStrategy, drawingSeed } = filter;
 		const owned = options.monitor ? null : options.owned || getOwnedColorIds();
 		if (!options.monitor && !owned) throw new Error("La palette du compte GeoPixels est indisponible. Ouvrez « Palette et filtres » puis cliquez sur Actualiser.");
 		const paletteKey = owned ? [...owned].sort((a, b) => a - b).join(",") : "?";
-		const key = settingsSignature() + "|" + (options.monitor ? "monitor" : paletteKey);
+		const orderKey = orderTargets ? drawingStrategy + (drawingStrategy === "random" ? ":" + drawingSeed : "") : "";
+		const key = settingsSignature() + "|" + (options.monitor ? "monitor" : paletteKey) + "|" + orderKey;
 		const existing = options.onlyUnowned ? purchaseTargetCache : targetCache;
 		if (existing?.model === model && existing.key === key) return existing;
-		const orderTargets = !options.onlyUnowned && !options.monitor;
 
 		const { colors, width, gridX, gridY } = model;
 		const ignored = new Set(filter.ignoredColors);
@@ -1778,31 +1903,7 @@
 		}
 
 		let indices = count === unordered.length ? unordered : unordered.slice(0, count);
-		if (orderTargets && count > 1) {
-			// Départage par rareté, puis taille de région, puis priorité manuelle. Les égalités restent dans l’ordre du modèle.
-			let scratch = new Uint32Array(count);
-			const keys = new Uint32Array(colors.length);
-			if (frequencies.size > 1) {
-				for (let index = 0; index < count; index++) {
-					const pixel = indices[index];
-					keys[pixel] = frequencies.get(colors[pixel]);
-					if ((index + 1) % WORK_CHUNK === 0) await yieldWork();
-				}
-				[indices, scratch] = await sortTargetKeys(indices, keys, scratch);
-			}
-			if (filter.smartPriority) {
-				const regions = await measureRegions(model, indices, ranks);
-				[indices, scratch] = await sortTargetKeys(indices, regions, scratch);
-			}
-			if (priority.size > 0) {
-				for (let index = 0; index < count; index++) {
-					const pixel = indices[index];
-					keys[pixel] = priority.get(colors[pixel]) ?? priority.size;
-					if ((index + 1) % WORK_CHUNK === 0) await yieldWork();
-				}
-				[indices] = await sortTargetKeys(indices, keys, scratch);
-			}
-		}
+		if (orderTargets) indices = await orderTargetIndices(model, indices, ranks, frequencies, priority, drawingStrategy, drawingSeed);
 
 		const words = Math.ceil(count / 32);
 		// Un bit par rang représente un pixel observé à peindre. Les compteurs n’ont pas besoin de parcourir ces listes.
@@ -3444,6 +3545,62 @@
 		queueTargetPreview();
 	}
 
+	function setDrawingStrategy(strategy) {
+		if (!Object.hasOwn(DRAWING_STRATEGIES, strategy) || strategy === settings.drawingStrategy) return;
+		settings.drawingStrategy = strategy;
+		settings.smartPriority = strategy === "smart";
+		if (strategy === "random" && !settings.drawingSeed) {
+			settings.drawingSeed = (Math.random() * 0x100000000) >>> 0;
+		}
+		saveSettings();
+		if (!state.monitoring && settings.workMode === "construction") {
+			// La stratégie change uniquement l’ordre de construction. Les observations et achats restent en cache.
+			targetRevision++;
+			targetCache = null;
+			queueTargetPreview();
+		}
+		void renderDrawingStrategy();
+	}
+
+	async function renderDrawingStrategy() {
+		if (!ui.drawingStrategy) return;
+		const { drawingStrategy: strategy, drawingSeed } = settings;
+		ui.drawingStrategy.value = strategy;
+		ui.drawingDescription.textContent = DRAWING_STRATEGIES[strategy].description;
+		if (!ui.drawingSection.open) return;
+		const key = strategy + ":" + drawingSeed;
+		if (drawingPreviewKey === key) return;
+		drawingPreviewKey = key;
+
+		const colors = Int32Array.from([
+			0, 0, 0, 0, 1,
+			0, 0, 0, 1, 1,
+			0, 0, 0, 1, 1,
+			0, 0, 1, 1, 1,
+			2, 0, 0, 1, 1,
+		], (color) => PREVIEW_COLORS[color]);
+		const indices = Uint32Array.from(colors, (_, index) => index);
+		const ranks = new Uint32Array(colors.length).fill(1);
+		const frequencies = new Map();
+		for (const color of colors) frequencies.set(color, (frequencies.get(color) ?? 0) + 1);
+		const order = await orderTargetIndices({ width: 5, height: 5, colors }, indices, ranks, frequencies, new Map(), strategy, drawingSeed);
+		if (drawingPreviewKey !== key) return;
+		order.forEach((pixel, rank) => { ranks[pixel] = rank + 1; });
+		ui.drawingPreview.innerHTML = Array.from(ranks, (rank, pixel) =>
+			'<span class="gpc-drawing-cell" style="--gpc-preview-color:' + colorHex(colors[pixel]) + '">' + rank + '</span>'
+		).join("");
+	}
+
+	function bindDrawingStrategy(panel) {
+		ui.drawingSection = panel.querySelector("#gpc-drawing-section");
+		ui.drawingStrategy = panel.querySelector("#gpc-drawing-strategy");
+		ui.drawingDescription = panel.querySelector("#gpc-drawing-description");
+		ui.drawingPreview = panel.querySelector("#gpc-drawing-preview");
+		ui.drawingStrategy.addEventListener("change", () => setDrawingStrategy(ui.drawingStrategy.value));
+		ui.drawingSection.addEventListener("toggle", () => { void renderDrawingStrategy(); });
+		void renderDrawingStrategy();
+	}
+
 	function mountUI() {
 		if (document.getElementById("gpc-panel")) return;
 
@@ -3600,6 +3757,9 @@
 			.gpc-energy-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
 			.gpc-energy-grid label { min-width: 0; display: grid; gap: 3px; }
 			.gpc-energy-summary { display: flex; flex-wrap: wrap; gap: 2px 9px; margin-bottom: 6px; }
+			#gpc-drawing-description { margin: 7px 0; }
+			#gpc-drawing-preview { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 3px; width: min(100%, 140px); margin: 5px 0 0; }
+			.gpc-drawing-cell { display: grid; place-items: center; aspect-ratio: 1; border-radius: 3px; background: var(--gpc-preview-color); color: #fff; font: 700 10px/1 Arial, sans-serif; }
 			#gpc-maintenance-controls { min-width: 0; padding: 0; border: 0; margin: 0; }
 			#gpc-maintenance-samples { white-space: pre-line; margin: 0 0 4px; overflow-wrap: anywhere; }
 			.gpc-auto-summary { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 3px 8px; margin: 7px 0; }
@@ -3738,6 +3898,15 @@
 						</label>
 					</fieldset>
 				</details>
+				<details class="gpc-section" id="gpc-drawing-section">
+					<summary>Stratégie de dessin</summary>
+					<select id="gpc-drawing-strategy" class="gpc-input" aria-label="Stratégie de dessin" aria-describedby="gpc-drawing-description">
+						${Object.entries(DRAWING_STRATEGIES).map(([value, { label }]) => '<option value="' + value + '">' + label + '</option>').join("")}
+					</select>
+					<div id="gpc-drawing-description" class="gpc-muted"></div>
+					<div class="gpc-muted">Exemple d’ordre sur une grille de 5 × 5</div>
+					<div id="gpc-drawing-preview" role="img" aria-label="Aperçu numéroté de l’ordre de traitement sur 25 pixels"></div>
+				</details>
 				<details class="gpc-section">
 					<summary>Réglages de l’énergie</summary>
 					<fieldset id="gpc-energy-controls" class="gpc-energy-grid" aria-label="Réglages de l’énergie">
@@ -3817,7 +3986,6 @@
 						<label class="gpc-check"><input id="gpc-free" type="checkbox"> Inclure les couleurs de base gratuites</label>
 						<label class="gpc-check"><input id="gpc-alpha" type="checkbox"> Inclure les pixels transparents</label>
 						<div class="gpc-muted">En Construction, inclure la transparence peut effacer des pixels déjà peints.</div>
-						<label class="gpc-check"><input id="gpc-smart-priority" type="checkbox"> Priorité intelligente</label>
 						<label class="gpc-check"><input id="gpc-wrong-color-priority" type="checkbox"> Corriger les couleurs incorrectes en priorité</label>
 					</details>
 					<div class="gpc-row gpc-palette-tools">
@@ -3916,7 +4084,6 @@
 		ui.etaText = panel.querySelector("#gpc-eta");
 		ui.free = panel.querySelector("#gpc-free");
 		ui.alpha = panel.querySelector("#gpc-alpha");
-		ui.smartPriority = panel.querySelector("#gpc-smart-priority");
 		ui.wrongColorPriority = panel.querySelector("#gpc-wrong-color-priority");
 		ui.areaMode = panel.querySelector("#gpc-area-mode");
 		ui.areaX1 = panel.querySelector("#gpc-area-x1");
@@ -3932,11 +4099,11 @@
 
 		ui.free.checked = !!settings.includeFreeColors;
 		ui.alpha.checked = !!settings.includeTransparent;
-		ui.smartPriority.checked = !!settings.smartPriority;
 		ui.wrongColorPriority.checked = !!settings.prioritizeIncorrectColors;
 		bindEnergySettings();
 		bindAutomaticPurchases();
 		bindPalette(panel);
+		bindDrawingStrategy(panel);
 		const maintenanceInterval = panel.querySelector("#gpc-maintenance-interval");
 		const autoMaintenance = panel.querySelector("#gpc-maintenance-auto");
 		ui.workMode.value = settings.workMode;
@@ -3976,11 +4143,6 @@
 		ui.alpha.addEventListener("change", () => {
 			settings.includeTransparent = ui.alpha.checked;
 			applyFiltersChanged();
-		});
-		ui.smartPriority.addEventListener("change", () => {
-			settings.smartPriority = ui.smartPriority.checked;
-			applyFiltersChanged();
-			setStatus("idle", settings.smartPriority ? "Priorité intelligente activée." : "Priorité intelligente désactivée.");
 		});
 		ui.wrongColorPriority.addEventListener("change", () => {
 			settings.prioritizeIncorrectColors = ui.wrongColorPriority.checked;
@@ -4168,9 +4330,7 @@
 			applyFiltersChanged();
 		},
 		smartPriority(enabled = true) {
-			settings.smartPriority = !!enabled;
-			if (ui.smartPriority) ui.smartPriority.checked = settings.smartPriority;
-			applyFiltersChanged();
+			setDrawingStrategy(enabled ? "smart" : "color");
 		},
 		prioritizeIncorrectColors(enabled = true) {
 			settings.prioritizeIncorrectColors = !!enabled;

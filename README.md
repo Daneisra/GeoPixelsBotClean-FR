@@ -1,6 +1,6 @@
 # GeoPixelsBotClean-FR
 
-Version française de GhostPixel Bot Clean pour GeoPixels. La version **1.1.16** construit et surveille les images fantômes, suit leur progression et aide à gérer les couleurs et l’énergie. Le script Tampermonkey fonctionne sans serveur supplémentaire. Voir l’[historique des versions](CHANGELOG.md).
+Version française de GhostPixel Bot Clean pour GeoPixels. La version **1.1.17** construit et surveille les images fantômes, suit leur progression et aide à gérer les couleurs et l’énergie. Le script Tampermonkey fonctionne sans serveur supplémentaire. Voir l’[historique des versions](CHANGELOG.md).
 
 ## Installation
 
@@ -10,7 +10,7 @@ Installez Tampermonkey, puis ouvrez [le script du dépôt français](https://raw
 
 1. Connectez-vous à GeoPixels, puis chargez et positionnez votre image fantôme.
 2. Ouvrez le panneau flottant **GhostPixel** et cliquez sur **Synchroniser** pour afficher la progression, l’énergie et le temps estimé.
-3. Choisissez les couleurs dans **Palette et filtres** et les zones à traiter sur la carte. Vous pouvez exclure des couleurs, choisir leur ordre de peinture, limiter la sélection aux prioritaires ou privilégier les détails.
+3. Choisissez les couleurs dans **Palette et filtres**, les zones à traiter sur la carte et l’ordre de traitement dans **Stratégie de dessin**.
 4. En mode **Construction**, cliquez sur **Démarrer** pour peindre. Le panneau indique si le prochain groupe attend une recharge et affiche une notification à la fin des envois.
 
 Le bouton **Acheter les couleurs manquantes** vérifie les pixels restants dans les zones sélectionnées et demande confirmation avant chaque lot de cinq couleurs au maximum. Le bouton **Augmenter la capacité d’énergie** utilise le solde de pixels disponible pour acheter des unités de capacité.
@@ -28,6 +28,20 @@ Le panneau distingue **chargement**, **synchronisée**, **indisponible** et **er
 - **Inclure les pixels transparents** traite la transparence séparément de la palette de base. En Construction, l’option peut effacer des pixels déjà peints.
 
 Les compteurs se recalculent à partir du modèle et des observations en cache lorsque les filtres changent. Pendant la peinture ou la surveillance, ils se recalculent au prochain passage. Si GeoPixels change le format de sa palette de base, les couleurs détenues restent visibles et leur type est indiqué comme inconnu. Le filtre d’exclusion des couleurs de base demande une palette de base vérifiée.
+
+### Stratégie de dessin
+
+Dans la section repliable **Stratégie de dessin**, le menu propose dix ordres. La grille numérotée de 5 × 5 illustre le parcours sur un exemple.
+
+- **Haut vers bas** et **Bas vers haut** parcourent les rangées de gauche à droite. **Gauche vers droite** et **Droite vers gauche** parcourent les colonnes du haut vers le bas.
+- **Centre vers extérieur** et **Extérieur vers centre** utilisent la distance au centre du rectangle qui encadre les pixels sélectionnés.
+- **Contours en priorité** traite les bords de la sélection et les transitions entre deux couleurs avant les intérieurs.
+- **Par couleur** regroupe les pixels par couleur, de la moins fréquente à la plus fréquente.
+- **Priorité intelligente** privilégie les petites régions de même couleur, puis départage selon la rareté. **Aléatoire** conserve le même ordre entre les sessions tant que la sélection reste identique.
+
+Les exclusions et les zones déterminent les pixels retenus. Les corrections prioritaires et les priorités de couleurs s’appliquent ensuite, selon les options choisies. L’énergie détermine quand peindre et combien de pixels envoyer par groupe.
+
+La stratégie est sauvegardée. À la mise à jour, l’ancienne option activée devient **Priorité intelligente** et l’option désactivée devient **Par couleur**. Le script conserve l’ordre calculé tant que le modèle, la sélection et la stratégie restent identiques. L’aperçu apparaît à la première ouverture de la section et se met à jour au changement de stratégie.
 
 ### Maintenance du modèle
 
@@ -86,6 +100,10 @@ git show a995066:ghostpixel-bot-clean.user.js | Set-Content -Encoding UTF8 v1.1.
 node tests/benchmark.cjs v1.1.12.user.js
 node tests/benchmark.cjs
 ```
+
+On peut aussi mesurer une stratégie précise avec `node tests/benchmark.cjs ghostpixel-bot-clean.user.js 1500 center-out`. Le banc d’essai vérifie la réutilisation du même ordre après la synchronisation et mesure vingt lectures du cache.
+
+Sur le même modèle de 2,25 millions de pixels, la préparation en **Priorité intelligente** a pris 2,75 s en v1.1.16 et 2,71 s en v1.1.17. En v1.1.17, elle a pris 0,73 s en **Haut vers bas**, 2,42 s en **Centre vers extérieur** et 1,23 s en **Aléatoire**. Vingt lectures ont réutilisé le même ordre en 25 à 33 ms pour les stratégies mesurées.
 
 ## Stockage et session
 

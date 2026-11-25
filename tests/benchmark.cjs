@@ -5,6 +5,7 @@ const { performance } = require("node:perf_hooks");
 
 const file = process.argv[2] ?? path.join(__dirname, "../ghostpixel-bot-clean.user.js");
 const width = Number(process.argv[3] ?? 1500);
+const strategy = process.argv[4] ?? "smart";
 const pixels = width ** 2;
 const data = new Uint8ClampedArray(pixels * 4);
 for (let y = 0; y < width; y++) {
@@ -22,6 +23,8 @@ const context = vm.createContext({
 	Colors: ["#123456", "#273456", "#3C3456"],
 	userID: 7,
 	tokenUser: "benchmark-fixture",
+	localStorage: { getItem: (key) => key === "ghostpixel_clean_settings"
+		? JSON.stringify({ drawingStrategy: strategy, drawingSeed: 123456 }) : null },
 	userData: { id: 7, colors: [0x123456, 0x273456, 0x3C3456] },
 	ghostImageOriginalData: { width, height: width, data },
 	ghostImageTopLeft: { x: -523, y: 679 },
@@ -89,6 +92,11 @@ async function measure(action) {
 	const build = await measure(() => bot.buildTargets());
 	const full = await measure(() => bot.syncBoard());
 	const delta = await measure(() => bot.syncBoard());
+	const warm = await measure(async () => {
+		for (let i = 0; i < 20; i++) {
+			if (await bot.buildTargets() !== build.result) throw new Error("La sélection réutilise le même ordre.");
+		}
+	});
 	const progress = await measure(() => {
 		for (let i = 0; i < 20; i++) bot.updateProgress();
 	});
@@ -97,8 +105,8 @@ async function measure(action) {
 			if (bot.next(build.result, 5000).length !== 5000) throw new Error("Le groupe doit contenir 5 000 pixels.");
 		}
 	});
-	for (const sample of [build, full, delta, progress, groups]) delete sample.result;
-	console.log(JSON.stringify({ pixels, build, full, delta, progress, groups, ...stats }, null, 2));
+	for (const sample of [build, full, delta, warm, progress, groups]) delete sample.result;
+	console.log(JSON.stringify({ pixels, strategy, build, full, delta, warm, progress, groups, ...stats }, null, 2));
 })().catch((error) => {
 	console.error(error);
 	process.exitCode = 1;

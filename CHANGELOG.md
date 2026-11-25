@@ -1,5 +1,11 @@
 # Historique des versions
 
+## 1.1.17 · 2026-11-26
+
+- Dix stratégies de dessin comprenant quatre directions, deux ordres radiaux, les contours, le regroupement par couleur, la priorité intelligente et l’ordre aléatoire.
+- Section repliable avec description et aperçu numéroté, calculé à la demande.
+- Réutilisation du plan de peinture existant, de ses observations et de ses filtres. Migration et sauvegarde de la stratégie.
+
 ## 1.1.16 · 2026-11-25
 
 - Correction de la synchronisation de la palette du compte pour les listes texte et les valeurs HEX.
