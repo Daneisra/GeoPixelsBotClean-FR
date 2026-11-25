@@ -1,6 +1,6 @@
 # GeoPixelsBotClean-FR
 
-Version française de GhostPixel Bot Clean pour GeoPixels. La version **1.1.15** construit et surveille les images fantômes, suit leur progression et aide à gérer les couleurs et l’énergie. Le script Tampermonkey fonctionne sans serveur supplémentaire. Voir l’[historique des versions](CHANGELOG.md).
+Version française de GhostPixel Bot Clean pour GeoPixels. La version **1.1.16** construit et surveille les images fantômes, suit leur progression et aide à gérer les couleurs et l’énergie. Le script Tampermonkey fonctionne sans serveur supplémentaire. Voir l’[historique des versions](CHANGELOG.md).
 
 ## Installation
 
@@ -18,6 +18,10 @@ Le bouton **Acheter les couleurs manquantes** vérifie les pixels restants dans 
 ### Palette et filtres
 
 Alternez entre **Couleurs du modèle** et **Couleurs du compte**. Chaque ligne affiche un aperçu, le code HEX, la disponibilité et le nombre de pixels du modèle. Après le calcul de la sélection, elle indique aussi le nombre de pixels retenus. La palette s’affiche par pages de vingt couleurs. La recherche par code HEX exact et le bouton **Actualiser** restent disponibles.
+
+La lecture accepte les identifiants numériques, leur équivalent en texte et les codes HEX, dans un tableau ou une liste séparée par des virgules. La réponse du compte a priorité. Si elle omet la liste, le script peut utiliser le profil de la page ou la palette native `Colors` lorsqu’ils sont rattachés au compte actif. La transparence figure séparément des couleurs détenues.
+
+Le panneau distingue **chargement**, **synchronisée**, **indisponible** et **erreur de lecture**. Le diagnostic indique la source retenue, le format détecté, l’état de `Colors` et, s’il est disponible, le code HTTP. Il ne contient ni identifiant de compte ni donnée de session. En cas de problème, cliquez sur **Actualiser** et relevez le diagnostic du panneau. La même fiche est accessible dans la console par `ghostBot.paletteDebug()`.
 
 - **Priorité** fait passer une couleur avant les couleurs sans priorité. **Exclure** la retire de la sélection. Pour peindre ou surveiller uniquement les couleurs prioritaires, activez **Limiter la sélection aux couleurs prioritaires** dans **Règles de sélection**. Une liste prioritaire enregistrée en v1.1.14 ou avant conserve son ancien filtrage lors de la mise à jour. Vous pouvez désactiver ce filtre en gardant vos priorités.
 - **Inclure les couleurs de base gratuites** applique la palette de démarrage publiée par GeoPixels. La liste des couleurs détenues vient du compte et est relue après les achats. Les couleurs non détenues sont indiquées comme manquantes uniquement lorsque le compte a pu être vérifié.

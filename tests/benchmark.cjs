@@ -21,6 +21,7 @@ const context = vm.createContext({
 	setTimeout, clearTimeout, AbortSignal,
 	Colors: ["#123456", "#273456", "#3C3456"],
 	userID: 7,
+	tokenUser: "benchmark-fixture",
 	userData: { id: 7, colors: [0x123456, 0x273456, 0x3C3456] },
 	ghostImageOriginalData: { width, height: width, data },
 	ghostImageTopLeft: { x: -523, y: 679 },

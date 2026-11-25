@@ -1,5 +1,12 @@
 # Historique des versions
 
+## 1.1.16 · 2026-11-25
+
+- Correction de la synchronisation de la palette du compte pour les listes texte et les valeurs HEX.
+- Récupération depuis le profil ou la palette native lorsque la source peut être rattachée au compte actif.
+- Diagnostic de chargement, d’indisponibilité ou d’erreur sans données de session. Nouvelle lecture et recalcul de la sélection avec **Actualiser**.
+- Transparence séparée des couleurs détenues et calcul des tarifs automatiques fondé sur le nombre de couleurs normalisées.
+
 ## 1.1.15 · 2026-11-25
 
 - Palette interactive du modèle et du compte avec aperçu, HEX, disponibilité, compteurs, recherche et pagination.

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GhostPixel Bot Clean
 // @namespace    https://github.com/Fox3225/GeoPixelsBotClean
-// @version      1.1.15
+// @version      1.1.16
 // @description  Script GeoPixels pour peindre des images fantômes, synchroniser la progression, recevoir une notification de fin, gérer les priorités de couleurs, acheter les couleurs manquantes et augmenter la capacité d’énergie.
 // @author       Fox3225 + Codex
 // @match        https://geopixels.net/*
@@ -22,7 +22,7 @@
 	"use strict";
 
 	const win = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
-	const VERSION = "1.1.15";
+	const VERSION = "1.1.16";
 	const ACCOUNT_MONITOR_URL = "http://127.0.0.1:47631/connect";
 	const TILE_SIZE = 1000;
 	const TILE_BATCH_SIZE = 9;
@@ -113,6 +113,8 @@
 	let imageAnalysis = null;
 	let accountColors = null;
 	let accountReadSequence = 0;
+	let nativePalette = null;
+	let paletteReading = { sequence: 0, accountId: null, status: "loading", source: null, httpStatus: null, format: null, native: null, reason: null };
 	let baseColors = null;
 	let baseColorsRequest = null;
 	let targetPreview = null;
@@ -837,28 +839,97 @@
 	}
 
 	function getOwnedColorIds() {
-		const accountId = getAuthPayload().userId;
-		if (!(accountId > 0)) return null;
+		const { userId: accountId, token } = getAuthPayload();
+		if (!token || !(accountId > 0)) return null;
 		if (accountColors?.accountId === accountId) return accountColors.colors;
 		const data = readGlobal("userData");
 		return accountId === normalizeUserId(data?.id) ? accountPalette(data) : null;
 	}
 
-	function acceptAccountPalette(accountId, data, sequence) {
-		const colors = accountPalette(data);
-		if (!colors || (accountColors?.accountId === accountId && accountColors.sequence > sequence)) return;
+	function acceptAccountPalette(accountId, colors) {
 		const previous = accountColors?.colors;
 		if (accountColors?.accountId === accountId && previous.size === colors.size &&
-			[...colors].every((color) => previous.has(color))) {
-			accountColors.sequence = sequence;
-			return;
-		}
-		accountColors = { accountId, colors, sequence };
+			[...colors].every((color) => previous.has(color))) return;
+		accountColors = { accountId, colors };
 		if (!state.monitoring) invalidateTargets();
 		if (ui.paletteSection?.open) {
 			renderPalette();
 			queueTargetPreview();
 		}
+	}
+
+	function clearPreviousPalette(accountId) {
+		if (!accountColors || accountColors.accountId === accountId) return;
+		accountColors = null;
+		if (!state.monitoring && settings.workMode === "construction") {
+			invalidateTargets();
+			updateProgress();
+		}
+	}
+
+	function observeNativePalette(accountId, verifiedColors) {
+		const raw = readGlobal("Colors");
+		const liveId = normalizeUserId(readGlobal("userID"));
+		const profileId = normalizeUserId(readGlobal("userData")?.id);
+		const session = liveId === accountId && accountId > 0 && !!readGlobal("tokenUser") &&
+			(profileId === null || profileId === accountId);
+		const previous = nativePalette;
+		const sameList = previous && previous.raw === raw;
+		const colors = sameList ? previous.colors : Array.isArray(raw) ? normalizeAccountColors(raw) : null;
+		// Colors commence par la palette publique et peut subsister après déconnexion.
+		const matchesAccount = colors && verifiedColors && colors.size === verifiedColors.size &&
+			[...colors].every((color) => verifiedColors.has(color));
+		const tiedToAccount = session && colors && (matchesAccount ||
+			(!verifiedColors && previous?.accountId === accountId && (sameList ? previous.tiedToAccount : colors.size > 0)));
+		nativePalette = { raw, colors, accountId: session ? accountId : null, tiedToAccount };
+		return {
+			colors: tiedToAccount ? colors : null,
+			state: !Array.isArray(raw) ? "Inaccessible" : !colors ? "Format non reconnu"
+				: tiedToAccount ? "Rattachée au compte" : "Visible, rattachement non vérifié",
+		};
+	}
+
+	function setPaletteReading(sequence, fields) {
+		if (sequence < paletteReading.sequence) return;
+		const changed = Object.entries(fields).some(([key, value]) => paletteReading[key] !== value);
+		paletteReading = { sequence, ...fields };
+		if (changed) renderPalette();
+	}
+
+	function reportAccountPalette(accountId, sequence, data, status, previousProfile, reason) {
+		if (sequence < paletteReading.sequence || accountId !== getAuthPayload().userId) return;
+		const value = data?.colors;
+		const api = accountPalette(data);
+		const profile = !api && accountId > 0 && normalizeUserId(previousProfile?.id) === accountId
+			&& accountPalette(previousProfile);
+		const native = observeNativePalette(accountId, api || profile);
+		const colors = api || profile || native.colors;
+		const format = Array.isArray(value) ? "tableau" : typeof value === "string" ? "liste texte"
+			: value == null ? "champ absent" : "format non reconnu";
+		const source = api ? "/GetUserData" : profile ? "Profil de la page" : native.colors ? "Colors (palette native)" : null;
+		if (colors) acceptAccountPalette(accountId, colors);
+		setPaletteReading(sequence, {
+			accountId,
+			status: colors ? "synced" : reason || value != null || (status !== null && status !== 200) ? "error" : "unavailable",
+			source, format, native: native.state, httpStatus: status,
+			reason: reason ?? (api ? null : value != null ? "Des valeurs de couleur ne sont pas reconnues."
+				: status && status !== 200 ? "La lecture du compte a échoué."
+				: "Aucune liste de couleurs dans la réponse du compte."),
+		});
+	}
+
+	function recoverNativePalette(accountId) {
+		if (!(accountId > 0) || accountColors?.accountId === accountId || paletteReading.status === "loading") return;
+		const data = readGlobal("userData");
+		const profile = normalizeUserId(data?.id) === accountId ? accountPalette(data) : null;
+		const native = observeNativePalette(accountId, profile);
+		const colors = profile ?? native.colors;
+		if (colors) acceptAccountPalette(accountId, colors);
+		setPaletteReading(paletteReading.sequence, {
+			...paletteReading,
+			...(colors ? { status: "synced", source: profile ? "Profil de la page" : "Colors (palette native)" } : {}),
+			native: native.state,
+		});
 	}
 
 	function parseBasePalette(source) {
@@ -1031,16 +1102,33 @@
 		return readCachedAvailablePixels();
 	}
 
-	async function fetchEnergySnapshot() {
+	async function fetchEnergySnapshot(showLoading = false) {
 		installPageBridge();
+		const auth = getAuthPayload();
+		const accountId = auth.userId;
+		const sequence = ++accountReadSequence;
+		clearPreviousPalette(auth.token ? accountId : null);
+		if (!auth.token || !(accountId > 0)) {
+			const native = observeNativePalette(null);
+			setPaletteReading(sequence, {
+				accountId, status: "unavailable", source: null, format: null, native: native.state, httpStatus: null,
+				reason: "Connectez-vous à GeoPixels, puis cliquez sur Actualiser.",
+			});
+			return { status: 401 };
+		}
+		const previousProfile = readGlobal("userData");
+		if (showLoading || !accountColors) observeNativePalette(accountId);
+		if (showLoading) {
+			const sameAccount = paletteReading.accountId === accountId;
+			setPaletteReading(sequence, {
+				accountId, status: "loading", source: sameAccount ? paletteReading.source : null,
+				format: null, native: null, httpStatus: null, reason: null,
+			});
+		}
 		try {
-			const accountId = getAuthPayload().userId;
-			const sequence = ++accountReadSequence;
 			let result;
 			if (typeof win.__gpcGetUserData === "function") result = await win.__gpcGetUserData();
 			if (!result || result.needsSession) {
-				const auth = getAuthPayload();
-				if (!auth.token || !Number.isFinite(auth.userId)) return { status: 401 };
 				const response = await fetch("/GetUserData", {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
@@ -1052,20 +1140,32 @@
 					status: response.status,
 					retryAfter: response.headers.get("Retry-After"),
 					serverDate: response.headers.get("Date"),
-					data: response.ok ? await response.json() : null,
+					data: response.ok ? await response.json().catch(() => null) : null,
 				};
 			}
-			const data = result.ok && accountId > 0 && accountId === getAuthPayload().userId &&
-				(result.data?.id == null || normalizeUserId(result.data.id) === accountId) ? result.data : null;
-			if (data) acceptAccountPalette(accountId, data, sequence);
+			const currentAccount = getAuthPayload().userId;
+			if (accountId !== currentAccount) {
+				setPaletteReading(sequence, {
+					accountId, status: "unavailable", source: null, format: null, native: null, httpStatus: null,
+					reason: "Le compte a changé. Cliquez sur Actualiser.",
+				});
+				return { status: 0 };
+			}
+			const validObject = result.data && typeof result.data === "object" && !Array.isArray(result.data);
+			const matchingId = result.data?.id == null || normalizeUserId(result.data.id) === accountId;
+			const data = result.ok && validObject && matchingId ? result.data : null;
+			const reason = !result.status ? "La requête de lecture du compte a échoué."
+				: result.ok && !validObject ? "La réponse du compte est illisible."
+				: result.ok && !matchingId ? "La réponse correspond à un autre compte." : null;
+			reportAccountPalette(accountId, sequence, data, result.status || null, previousProfile, reason);
 			return {
 				status: result.status,
 				retryAfter: result.retryAfter,
 				data,
 				energy: energyFromUserData(data, result.serverDate),
 			};
-		} catch (error) {
-			log("warn", "Lecture de l’énergie impossible.", error);
+		} catch {
+			reportAccountPalette(accountId, sequence, null, null, previousProfile, "La requête de lecture du compte a échoué.");
 			return { status: 0 };
 		}
 	}
@@ -1627,7 +1727,7 @@
 		const model = modelCache;
 		const filter = settings;
 		const owned = options.monitor ? null : options.owned || getOwnedColorIds();
-		if (!options.monitor && !owned) throw new Error("La palette du compte GeoPixels est en attente de synchronisation.");
+		if (!options.monitor && !owned) throw new Error("La palette du compte GeoPixels est indisponible. Ouvrez « Palette et filtres » puis cliquez sur Actualiser.");
 		const paletteKey = owned ? [...owned].sort((a, b) => a - b).join(",") : "?";
 		const key = settingsSignature() + "|" + (options.monitor ? "monitor" : paletteKey);
 		const existing = options.onlyUnowned ? purchaseTargetCache : targetCache;
@@ -1766,12 +1866,27 @@
 		return Number.isSafeInteger(balance) && balance >= 0 ? balance : null;
 	}
 
-	function accountPalette(data) {
-		const colors = data?.colors;
-		if (!Array.isArray(colors) || !colors.every((value) => Number.isInteger(value) && value >= -1 && value <= 0xFFFFFF)) {
-			return null;
+	function normalizeAccountColors(raw) {
+		const values = Array.isArray(raw) ? raw : typeof raw === "string" && raw.trim() ? raw.split(",") : null;
+		if (!values) return null;
+		const colors = new Set();
+		for (const value of values) {
+			let id = value;
+			if (typeof value === "string") {
+				const text = value.trim();
+				if (/^(?:#00000000|#0000-1|transparent)$/i.test(text)) continue;
+				const hex = text.match(/^(?:#|0x)([0-9a-f]{6})$/i)?.[1] ??
+					(/^[0-9a-f]{6}$/i.test(text) && /[a-f]/i.test(text) ? text : null);
+				id = hex ? Number.parseInt(hex, 16) : /^-?\d+$/.test(text) ? Number(text) : null;
+			}
+			if (!Number.isInteger(id) || id < -1 || id > 0xFFFFFF) return null;
+			if (id !== -1) colors.add(id);
 		}
-		return new Set(colors);
+		return colors;
+	}
+
+	function accountPalette(data) {
+		return normalizeAccountColors(data?.colors);
 	}
 
 	function readUpgradeTariff(type, colorCount) {
@@ -1850,7 +1965,7 @@
 		let colorSignature;
 		for (const type of config.order) {
 			if (!config.enabled.includes(type) || (!hasPendingPixels && type !== "ExtraColor")) continue;
-			const quote = readUpgradeTariff(type, reading.data?.colors?.length);
+			const quote = readUpgradeTariff(type, palette?.size);
 			if (!quote || (type === "ExtraColor" && !palette)) {
 				updateAutomaticPurchases("Tarif ou disponibilité non vérifiable.", AUTO_UPGRADES[type].label);
 				return outcome;
@@ -1900,7 +2015,7 @@
 		if (purchase.type === "ExtraColor") {
 			outcome.reading = await fetchEnergySnapshot();
 			const refreshedPalette = accountPalette(outcome.reading.data);
-			const refreshedTariff = readUpgradeTariff(purchase.type, outcome.reading.data?.colors?.length);
+			const refreshedTariff = readUpgradeTariff(purchase.type, refreshedPalette?.size);
 			if (automaticBalance(outcome.reading.data) !== balance || !refreshedPalette ||
 				refreshedPalette.has(purchase.amount) || refreshedTariff?.cost !== purchase.cost) {
 				updateAutomaticPurchases("Le solde ou la palette a changé. Nouvelle vérification requise.", next);
@@ -2340,9 +2455,8 @@
 
 	async function refreshAccount() {
 		const auth = getAuthPayload();
-		if (!auth.token || !Number.isFinite(auth.userId)) return;
 		const previous = state.energy;
-		const { energy } = await fetchEnergySnapshot();
+		const { energy } = await fetchEnergySnapshot(true);
 		if (state.energy === previous && energy && getAuthPayload().userId === auth.userId) {
 			state.energy = energy;
 			updateEnergyDisplay();
@@ -3062,13 +3176,17 @@
 		const image = readGlobal("ghostImageOriginalData");
 		const source = getGhostSource();
 		const position = source ? source.gridX + "," + source.gridY : null;
-		const accountId = getAuthPayload().userId;
+		const auth = getAuthPayload();
+		const accountId = auth.token ? auth.userId : null;
 		if (accountId !== paletteView.accountId) {
 			paletteView.accountId = accountId;
+			clearPreviousPalette(accountId);
 			renderPalette();
-			if (accountId > 0 && !getOwnedColorIds() && !state.running && !state.syncing) void refreshAccount();
+			if (accountId > 0 && paletteReading.accountId !== accountId && !getOwnedColorIds() &&
+				!state.running && !state.syncing) void refreshAccount();
 			queueTargetPreview();
 		}
+		recoverNativePalette(accountId);
 		if (position !== paletteView.position) {
 			paletteView.position = position;
 			queueTargetPreview();
@@ -3099,12 +3217,12 @@
 		const owned = getOwnedColorIds();
 		const fromAccount = ui.paletteSource.value === "account";
 		const histogram = paletteView.histogram;
-		let ids = (fromAccount ? (owned ? [...new Set([...owned, -1])] : []) : histogram?.ids) ?? [];
+		let ids = (fromAccount ? (owned ? [...owned] : []) : histogram?.ids) ?? [];
 		const query = ui.paletteSearch.value.trim();
 		if (query) {
 			const match = query.match(/^#?([0-9a-f]{6}|00000000)$/i);
 			const id = match ? toColorId("#" + match[1]) : null;
-			const present = fromAccount ? owned && (id === -1 || owned.has(id)) : histogram?.counts.has(id);
+			const present = fromAccount ? owned?.has(id) : histogram?.counts.has(id);
 			ids = present ? [id] : [];
 		}
 		const pages = Math.max(1, Math.ceil(ids.length / PALETTE_PAGE_SIZE));
@@ -3141,10 +3259,40 @@
 		ui.palettePage.textContent = (paletteView.page + 1) + " / " + pages;
 		ui.palettePrevious.disabled = paletteView.page === 0;
 		ui.paletteNext.disabled = paletteView.page + 1 >= pages;
-		ui.paletteMessage.textContent = fromAccount && !owned ? "Synchronisation de la palette du compte…"
+		ui.paletteMessage.textContent = fromAccount && !owned ? "Aucune liste de couleurs détenues à afficher."
 			: !fromAccount && !paletteView.image ? "Chargez un modèle ou affichez la palette du compte."
 			: !fromAccount && !histogram ? "Analyse des couleurs du modèle…"
 			: !ids.length ? "Aucune couleur trouvée." : numberFormat.format(ids.length) + (ids.length === 1 ? " couleur" : " couleurs");
+		ui.paletteTransparency.hidden = !fromAccount;
+		renderPaletteReading(owned);
+	}
+
+	function paletteDebug(owned = getOwnedColorIds()) {
+		const { status, source, format, native, httpStatus, reason } = paletteReading;
+		return {
+			status: status === "synced" && !owned ? "unavailable" : status,
+			source, format, native, httpStatus, reason, ownedCount: owned?.size ?? null,
+		};
+	}
+
+	function renderPaletteReading(owned) {
+		const { status, source, format, native, httpStatus, reason, ownedCount } = paletteDebug(owned);
+		const labels = {
+			loading: "Palette du compte en cours de chargement…",
+			synced: "Palette du compte synchronisée",
+			unavailable: "Palette du compte indisponible",
+			error: "Erreur de lecture de la palette du compte",
+		};
+		ui.paletteStatus.textContent = labels[status];
+		ui.paletteDiagnostic.textContent = [
+			httpStatus === null ? null : "HTTP " + httpStatus,
+			format ? "Réponse : " + format : null,
+			native ? "Colors : " + native : null,
+			source ? "Source : " + source : null,
+			ownedCount === null ? null : numberFormat.format(ownedCount) + " couleur(s) détenue(s)",
+			status !== "synced" && owned ? "Dernière palette vérifiée conservée." : null,
+			reason,
+		].filter(Boolean).join(" · ");
 	}
 
 	function bindPalette(panel) {
@@ -3153,6 +3301,9 @@
 		ui.paletteSearch = panel.querySelector("#gpc-palette-search");
 		ui.paletteList = panel.querySelector("#gpc-palette-list");
 		ui.paletteMessage = panel.querySelector("#gpc-palette-message");
+		ui.paletteStatus = panel.querySelector("#gpc-palette-status");
+		ui.paletteDiagnostic = panel.querySelector("#gpc-palette-diagnostic");
+		ui.paletteTransparency = panel.querySelector("#gpc-palette-transparency");
 		ui.palettePage = panel.querySelector("#gpc-palette-page");
 		ui.palettePrevious = panel.querySelector("#gpc-palette-previous");
 		ui.paletteNext = panel.querySelector("#gpc-palette-next");
@@ -3177,11 +3328,18 @@
 			paletteView.page++;
 			renderPalette();
 		});
-		panel.querySelector("#gpc-palette-refresh").addEventListener("click", async () => {
-			await Promise.all([loadBasePalette(), refreshAccount()]);
-			refreshPaletteModel();
-			renderPalette();
-			queueTargetPreview();
+		const refresh = panel.querySelector("#gpc-palette-refresh");
+		refresh.addEventListener("click", async () => {
+			refresh.disabled = true;
+			try {
+				await Promise.all([loadBasePalette(), refreshAccount()]);
+				refreshPaletteModel();
+				renderPalette();
+				queueTargetPreview();
+				if (targetPreview) await targetPreview;
+			} finally {
+				refresh.disabled = false;
+			}
 		});
 		ui.paletteSection.addEventListener("toggle", () => {
 			if (!ui.paletteSection.open) {
@@ -3472,6 +3630,8 @@
 			#gpc-palette-source { flex-basis: 100%; }
 			.gpc-palette-pages { justify-content: space-between; }
 			#gpc-palette-message { margin: 7px 0; }
+			#gpc-palette-status { margin-top: 7px; }
+			#gpc-palette-diagnostic { overflow-wrap: anywhere; }
 			.gpc-palette-row { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 8px; align-items: start; padding: 7px 0; border-bottom: 1px solid #253044; }
 			.gpc-palette-row small { color: #cbd5e1; }
 			.gpc-swatch { width: 20px; height: 20px; border-radius: 4px; border: 1px solid #64748b; background: var(--gpc-chip-color, repeating-conic-gradient(#94a3b8 0% 25%, #293548 0% 50%) 0 / 8px 8px); }
@@ -3668,8 +3828,11 @@
 						<input id="gpc-palette-search" class="gpc-input" type="search" placeholder="#123456" aria-label="Code HEX exact">
 						<button id="gpc-palette-refresh" class="gpc-btn" type="button">Actualiser</button>
 					</div>
+					<div id="gpc-palette-status" role="status"></div>
+					<div id="gpc-palette-diagnostic" class="gpc-muted"></div>
 					<div id="gpc-palette-message" class="gpc-muted" role="status"></div>
 					<div id="gpc-palette-list"></div>
+					<div id="gpc-palette-transparency" class="gpc-muted" hidden>Transparence (#00000000) : effacement, réglable séparément.</div>
 					<div class="gpc-row gpc-palette-pages">
 						<button id="gpc-palette-previous" class="gpc-btn" type="button">Précédent</button>
 						<span id="gpc-palette-page"></span>
@@ -4019,6 +4182,7 @@
 		buyMissingColors: buyMissingGhostColors,
 		buyEnergyCapacity,
 		buyAllEnergyCapacity: buyAllAffordableEnergyCapacity,
+		paletteDebug: () => paletteDebug(),
 		purchaseDebug: async () => {
 			const availablePixels = await fetchAvailablePixels();
 			let events = [];

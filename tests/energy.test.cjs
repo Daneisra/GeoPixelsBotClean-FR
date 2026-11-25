@@ -13,6 +13,7 @@ async function fixture({
 	balance = 50, rate = 15, palette = [0xFFFFFF], template, ledger, allow = true,
 	templateWidth = pixels, topLeft = { x: 0, y: 0 }, decodedTiles, initialAccountStatus = 200,
 	base = 'let Colors = ["#FFFFFF", "#000000", "#00000000"];',
+	nativeColors = palette, nativeProfile, formatAccountColors = (colors) => colors,
 } = {}) {
 	const nodes = new Map();
 	const timers = new Map();
@@ -25,6 +26,7 @@ async function fixture({
 	const painted = new Map();
 	const windowEvents = new Map();
 	const account = { energy, capacity, balance, colors: [...palette], paintResponses: [], purchaseResponses: [], status: initialAccountStatus, date: null, tick: 1, rate };
+	account.formatColors = formatAccountColors;
 	const tariffs = { FasterRecharge: 500, EnergyCapacity: 50, Energy: 10, ExtraColor: 100 };
 	const shop = new Map([
 		["FasterRechargeInput", () => tariffs.FasterRecharge + " Pixels / -1s (cap at 15s)"],
@@ -84,9 +86,9 @@ async function fixture({
 		if (url === "https://geopixels.net/js/index.js?c=4") return reply(200, base);
 		const body = JSON.parse(init.body);
 		if (url === "/GetUserData") {
-			const response = reply(account.status, {
+			const response = reply(account.status, account.responseBody ?? {
 				energy: account.reportedEnergy ?? account.energy, maxEnergy: account.capacity, checkedTick: account.tick,
-				energyRate: account.rate, pixels: account.balance * 5, colors: [...account.colors], id: account.id ?? 7,
+				energyRate: account.rate, pixels: account.balance * 5, colors: account.formatColors(account.colors), id: account.id ?? 7,
 			}, { Date: account.date, "Retry-After": account.readRetryAfter });
 			await account.delayedReads?.shift();
 			return response;
@@ -169,7 +171,7 @@ async function fixture({
 		confirm(message) { confirmations.push(message); return allow; },
 		userID: 7, tokenUser: "local-fixture", subject: "local-fixture",
 		currentEnergy: energy, maxEnergy: capacity, energyRate: account.rate,
-		Colors: palette,
+		Colors: nativeColors, userData: nativeProfile,
 		ghostImageOriginalData: { width: templateWidth, data: template ?? new Uint8Array(pixels * 4).fill(255) },
 		ghostImageTopLeft: topLeft,
 	});
@@ -203,6 +205,8 @@ async function fixture({
 			await flush();
 		},
 		setAccountId(id) { context.userID = id; account.id = id; },
+		setNativeColors(colors) { context.Colors = colors; },
+		logout() { context.tokenUser = ""; },
 		elapse(ms) { now += ms; },
 		async advance(expectedMs) {
 			assert.equal(timers.size, 1);
@@ -220,7 +224,7 @@ const sizes = (session, ...expected) => assert.deepEqual(session.requests, expec
 
 test("les salves par défaut attendent la pleine capacité, y compris après une augmentation", async () => {
 	const s = await fixture({ energy: 9, pixels: 15, settings: { minimized: true } });
-	assert.equal(s.bot.version, "1.1.15");
+	assert.equal(s.bot.version, "1.1.16");
 	assert.equal(s.bot.settings().energyMode, "salvos");
 	assert.equal(s.bot.settings().minimized, true);
 	const run = s.bot.start();
@@ -938,7 +942,7 @@ test("une palette de base illisible et un compte indisponible ne sont pas rempla
 	assert.match(unknown.node("palette-list").innerHTML, /Disponibilité inconnue/);
 	await unknown.bot.start();
 	sizes(unknown);
-	assert.match(unknown.node("message").textContent, /palette du compte.*synchronisation/);
+	assert.match(unknown.node("message").textContent, /palette du compte.*indisponible/);
 
 	const base = await fixture({ pixels: 1, base: "let Colors = getPalette();", settings: { includeFreeColors: false } });
 	await openPalette(base);
@@ -1012,4 +1016,129 @@ test("la palette limite les éléments affichés et retrouve un code HEX indépe
 	assert.equal(s.node("palette-page").textContent, "1 / 1");
 	assert.match(s.node("palette-list").innerHTML, /#123401/);
 	assert.doesNotMatch(s.node("palette-list").innerHTML, /#123414/);
+});
+
+test("le format CSV réel restaure les statistiques des 35 couleurs du modèle, y compris après rechargement", async () => {
+	const palette = Array.from({ length: 35 }, (_, index) => 0x123400 + index);
+	const template = new Uint8Array(palette.flatMap((color) => [color >>> 16, (color >>> 8) & 255, color & 255, 255]));
+	const config = { pixels: 35, palette, template, formatAccountColors: (colors) => colors.join(", ") };
+	for (let reload = 0; reload < 2; reload++) {
+		const s = await fixture(config);
+		await openPalette(s);
+		assert.equal(s.node("energy").textContent, "10 / 10");
+		assert.equal(s.node("count").textContent, "0 / 35");
+		assert.equal(s.node("palette-status").textContent, "Palette du compte synchronisée");
+		assert.equal(s.bot.paletteDebug().format, "liste texte");
+		assert.equal(s.bot.paletteDebug().ownedCount, 35);
+	}
+});
+
+test("les identifiants texte et HEX sont normalisés, et la transparence reste hors des couleurs détenues", async () => {
+	const s = await fixture({
+		pixels: 3, template: new Uint8Array([255, 255, 255, 255, 0, 0, 0, 255, 0x12, 0x34, 0x56, 255]),
+		formatAccountColors: () => ["16777215", "#123456", "0x123456", 0, "-1", "#00000000"],
+	});
+	await openPalette(s);
+	s.node("palette-source").value = "account";
+	s.node("palette-source").events.change();
+	assert.equal(s.bot.paletteDebug().ownedCount, 3);
+	assert.match(s.node("palette-list").innerHTML, /#FFFFFF/);
+	assert.match(s.node("palette-list").innerHTML, /#123456/);
+	assert.match(s.node("palette-list").innerHTML, /#000000/);
+	assert.doesNotMatch(s.node("palette-list").innerHTML, /#00000000/);
+	assert.equal(s.node("palette-transparency").hidden, false);
+	assert.equal(s.node("count").textContent, "0 / 3");
+});
+
+test("un échec réel est diagnostiqué et Actualiser retrouve ensuite la palette", async () => {
+	const s = await fixture({ pixels: 1, initialAccountStatus: 503 });
+	await openPalette(s);
+	assert.equal(s.node("palette-status").textContent, "Erreur de lecture de la palette du compte");
+	assert.match(s.node("palette-diagnostic").textContent, /HTTP 503/);
+	s.account.status = 200;
+	let release;
+	s.account.delayedReads = [new Promise((resolve) => { release = resolve; })];
+	const button = s.node("palette-refresh");
+	const refreshing = button.events.click();
+	await flush();
+	assert.equal(button.disabled, true);
+	assert.match(s.node("palette-status").textContent, /chargement/);
+	release();
+	await refreshing;
+	assert.equal(button.disabled, false);
+	assert.equal(s.bot.paletteDebug().status, "synced");
+	assert.equal(s.node("count").textContent, "0 / 1");
+});
+
+test("une valeur illisible ne crée ni palette partielle ni fuite de données", async () => {
+	const s = await fixture({
+		pixels: 1, nativeColors: null,
+		formatAccountColors: () => ["#FFFFFF", "texte-prive-a-ne-pas-afficher"],
+	});
+	await openPalette(s);
+	assert.equal(s.node("energy").textContent, "10 / 10");
+	assert.equal(s.bot.paletteDebug().status, "error");
+	assert.equal(s.bot.paletteDebug().ownedCount, null);
+	assert.match(s.node("palette-list").innerHTML, /Disponibilité inconnue/);
+	assert.doesNotMatch(JSON.stringify(s.bot.paletteDebug()) + s.node("palette-diagnostic").textContent,
+		/local-fixture|texte-prive-a-ne-pas-afficher|userId|token/i);
+});
+
+test("la palette native devient utilisable après rattachement à la session active", async () => {
+	const s = await fixture({
+		pixels: 1, nativeColors: ["#FFFFFF", "#00000000"], formatAccountColors: () => undefined,
+		template: new Uint8Array([0x12, 0x34, 0x56, 255]),
+	});
+	await openPalette(s);
+	assert.equal(s.bot.paletteDebug().status, "unavailable");
+	assert.match(s.bot.paletteDebug().native, /rattachement non vérifié/);
+	assert.equal(s.node("count").textContent, "0 / 0");
+	s.setNativeColors(["#FFFFFF", "#123456", "#00000000"]);
+	await s.node("palette-refresh").events.click();
+	assert.equal(s.bot.paletteDebug().source, "Colors (palette native)");
+	assert.equal(s.bot.paletteDebug().ownedCount, 2);
+	assert.equal(s.node("count").textContent, "0 / 1");
+	s.setAccountId(8);
+	await s.node("palette-refresh").events.click();
+	assert.equal(s.bot.paletteDebug().status, "unavailable");
+	assert.equal(s.bot.paletteDebug().ownedCount, null);
+	assert.match(s.node("palette-list").innerHTML, /Disponibilité inconnue/);
+	assert.equal(s.node("count").textContent, "0 / 0");
+});
+
+test("le profil de page vérifié reste utilisable si la réponse d’énergie omet la palette", async () => {
+	const s = await fixture({
+		pixels: 1, nativeProfile: { id: 7, colors: "#123456" }, formatAccountColors: () => undefined,
+		template: new Uint8Array([0x12, 0x34, 0x56, 255]),
+	});
+	await openPalette(s);
+	assert.equal(s.bot.paletteDebug().source, "Profil de la page");
+	assert.equal(s.node("count").textContent, "0 / 1");
+});
+
+test("une déconnexion rend la palette indisponible même si la page conserve l’ancien profil", async () => {
+	const s = await fixture({ pixels: 1 });
+	await openPalette(s);
+	assert.equal(s.bot.paletteDebug().ownedCount, 1);
+	s.logout();
+	await s.node("palette-refresh").events.click();
+	assert.equal(s.bot.paletteDebug().status, "unavailable");
+	assert.equal(s.bot.paletteDebug().ownedCount, null);
+	assert.match(s.node("palette-list").innerHTML, /Disponibilité inconnue/);
+});
+
+test("le tarif des achats automatiques utilise la taille normalisée d’une palette CSV", async () => {
+	const s = await fixture({
+		pixels: 1, balance: 0, palette: [0xFFFFFF, 0xAAAAAA, 0xBBBBBB, 0xCCCCCC, 0xDDDDDD],
+		formatAccountColors: (colors) => colors.join(", "),
+		template: new Uint8Array([0x12, 0x34, 0x56, 255]), settings: { automaticPurchases: automatic(["ExtraColor"]) },
+	});
+	const run = s.bot.start();
+	await flush();
+	assert.deepEqual(s.purchases, [{ type: "ExtraColor", amount: 0x123456 }]);
+	assert.equal(purchaseLedger(s).spent, 0);
+	await s.advance(1200);
+	await s.advance(1200);
+	await run;
+	sizes(s, 1);
 });
