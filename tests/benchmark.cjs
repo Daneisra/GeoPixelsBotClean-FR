@@ -20,11 +20,14 @@ const context = vm.createContext({
 	console: { log() {}, warn() {}, error() {} },
 	setTimeout, clearTimeout, AbortSignal,
 	Colors: ["#123456", "#273456", "#3C3456"],
+	userID: 7,
+	userData: { id: 7, colors: [0x123456, 0x273456, 0x3C3456] },
 	ghostImageOriginalData: { width, height: width, data },
 	ghostImageTopLeft: { x: -523, y: 679 },
 	document: {
 		readyState: "loading",
 		addEventListener() {},
+		getElementById() {},
 		createElement(tag) {
 			if (tag !== "canvas") return {};
 			return { getContext: () => ({ translate() {}, scale() {}, drawImage() {}, getImageData: () => tileImage }) };

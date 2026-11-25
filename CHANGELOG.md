@@ -1,5 +1,12 @@
 # Historique des versions
 
+## 1.1.15 · 2026-11-25
+
+- Palette interactive du modèle et du compte avec aperçu, HEX, disponibilité, compteurs, recherche et pagination.
+- Synchronisation des couleurs détenues au chargement et après vérification d’un achat. Lecture de la palette de base actuelle de GeoPixels.
+- Priorités et exclusions choisies directement dans la palette. Filtrage exclusif indépendant et reprise des anciens réglages.
+- Compteurs actualisés après modification de la sélection et réglage de transparence distinct des couleurs de base.
+
 ## 1.1.14 · 2026-11-24
 
 - Modes Construction et Maintenance avec intervalle de surveillance configurable et réglages persistants.

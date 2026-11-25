@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         GhostPixel Bot Clean
 // @namespace    https://github.com/Fox3225/GeoPixelsBotClean
-// @version      1.1.14
+// @version      1.1.15
 // @description  Script GeoPixels pour peindre des images fantômes, synchroniser la progression, recevoir une notification de fin, gérer les priorités de couleurs, acheter les couleurs manquantes et augmenter la capacité d’énergie.
 // @author       Fox3225 + Codex
 // @match        https://geopixels.net/*
@@ -22,7 +22,7 @@
 	"use strict";
 
 	const win = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
-	const VERSION = "1.1.14";
+	const VERSION = "1.1.15";
 	const ACCOUNT_MONITOR_URL = "http://127.0.0.1:47631/connect";
 	const TILE_SIZE = 1000;
 	const TILE_BATCH_SIZE = 9;
@@ -32,6 +32,7 @@
 	const MIN_MAINTENANCE_INTERVAL = 10;
 	const MAX_MAINTENANCE_INTERVAL = 3600;
 	const MAINTENANCE_SAMPLE_SIZE = 5;
+	const PALETTE_PAGE_SIZE = 20;
 	const UNKNOWN_COLOR = -2;
 	const PIXEL_UNKNOWN = 0;
 	const PIXEL_CORRECT = 1;
@@ -84,12 +85,6 @@
 		error: "Erreur",
 	};
 
-	const FREE_COLOR_IDS = new Set([
-		"#FFFFFF", "#FFCA3A", "#FF595E", "#F3BBC2", "#BD637D", "#6A4C93",
-		"#A8D0DC", "#1A535C", "#1982C4", "#8AC926", "#6B4226", "#CFD078",
-		"#8B1D24", "#C49A6C", "#000000", "#00000000",
-	].map(toColorId).filter((id) => id !== null));
-
 	const state = {
 		running: false,
 		syncing: false,
@@ -115,6 +110,12 @@
 	let targetCache = null;
 	let purchaseTargetCache = null;
 	let modelCache = null;
+	let imageAnalysis = null;
+	let accountColors = null;
+	let accountReadSequence = 0;
+	let baseColors = null;
+	let baseColorsRequest = null;
+	let targetPreview = null;
 	let targetRevision = 0;
 	let purchaseObserverInstalled = false;
 	let originalFetch = null;
@@ -124,7 +125,7 @@
 	let purchaseInFlight = false;
 	const autoPurchases = { balance: null, spent: 0, next: "", message: "", retryAt: 0 };
 	const purchaseEvents = [];
-	const purchasedColorIds = new Set();
+	const paletteView = { image: null, histogram: null, page: 0, request: 0, timer: null, accountId: null };
 	const ui = {};
 
 	function log(level, ...args) {
@@ -371,6 +372,9 @@
 							const response = await originalFetch(input, init);
 							if (shouldRecordFetch(requestUrl)) {
 								recordFetchEvent(requestUrl, response);
+							}
+							if (requestUrl === "/MakePurchase" && response.status === 200) {
+								window.dispatchEvent(new Event("gpc-account-purchase"));
 							}
 							return response;
 						};
@@ -632,6 +636,7 @@
 			includeTransparent: false,
 			ignoredColors: [],
 			priorityColors: [],
+			onlyPriorityColors: false,
 			smartPriority: true,
 			prioritizeIncorrectColors: false,
 			areas: [],
@@ -640,7 +645,8 @@
 			minimized: false,
 		};
 		try {
-			const loaded = { ...fallback, ...JSON.parse(storageGet(SETTINGS_KEY) || "{}") };
+			const stored = JSON.parse(storageGet(SETTINGS_KEY) || "{}");
+			const loaded = { ...fallback, ...stored };
 			Object.assign(loaded, normalizeEnergySettings(loaded));
 			loaded.workMode = loaded.workMode === "maintenance" ? "maintenance" : "construction";
 			loaded.maintenanceInterval = normalizeMaintenanceInterval(loaded.maintenanceInterval);
@@ -652,6 +658,9 @@
 			loaded.priorityColors = Array.isArray(loaded.priorityColors)
 				? loaded.priorityColors.map(toColorId).filter((id) => id !== null)
 				: [];
+			// Jusqu’à la v1.1.14, une liste de priorités limitait aussi la sélection.
+			loaded.onlyPriorityColors = stored?.onlyPriorityColors === undefined
+				? loaded.priorityColors.length > 0 : stored.onlyPriorityColors === true;
 			loaded.smartPriority = loaded.smartPriority !== false;
 			loaded.prioritizeIncorrectColors = loaded.prioritizeIncorrectColors === true;
 			loaded.areas = Array.isArray(loaded.areas)
@@ -828,22 +837,64 @@
 	}
 
 	function getOwnedColorIds() {
-		const colors = readGlobal("Colors");
-		const verifiedPalette = autoPurchases.palette;
-		if (verifiedPalette && verifiedPalette.accountId === getAuthPayload().userId) {
-			return new Set([...verifiedPalette.colors, ...purchasedColorIds]);
-		}
-		if (!Array.isArray(colors)) {
-			return purchasedColorIds.size ? new Set(purchasedColorIds) : null;
-		}
+		const accountId = getAuthPayload().userId;
+		if (!(accountId > 0)) return null;
+		if (accountColors?.accountId === accountId) return accountColors.colors;
+		const data = readGlobal("userData");
+		return accountId === normalizeUserId(data?.id) ? accountPalette(data) : null;
+	}
 
-		const result = new Set();
-		for (const color of colors) {
-			const id = toColorId(color);
-			if (id !== null) result.add(id);
+	function acceptAccountPalette(accountId, data, sequence) {
+		const colors = accountPalette(data);
+		if (!colors || (accountColors?.accountId === accountId && accountColors.sequence > sequence)) return;
+		const previous = accountColors?.colors;
+		if (accountColors?.accountId === accountId && previous.size === colors.size &&
+			[...colors].every((color) => previous.has(color))) {
+			accountColors.sequence = sequence;
+			return;
 		}
-		for (const id of purchasedColorIds) result.add(id);
-		return result;
+		accountColors = { accountId, colors, sequence };
+		if (!state.monitoring) invalidateTargets();
+		if (ui.paletteSection?.open) {
+			renderPalette();
+			queueTargetPreview();
+		}
+	}
+
+	function parseBasePalette(source) {
+		const literal = source.match(/^[ \t]*(?:let|const|var)[ \t]+Colors\s*=\s*\[([^\]]*)\]/m)?.[1];
+		if (!literal) return null;
+		const colors = literal.trim().replace(/,\s*$/, "").split(",").map((value) =>
+			value.trim().match(/^(['"])(#[0-9a-f]{6}|#00000000)\1$/i)?.[2]);
+		if (!colors.length || colors.some((color) => !color)) return null;
+		return new Set(colors.map(toColorId).filter((color) => color !== -1));
+	}
+
+	async function loadBasePalette() {
+		if (baseColors) return baseColors;
+		if (baseColorsRequest) return baseColorsRequest;
+		const script = Array.from(document.scripts ?? []).find(({ src }) => {
+			if (!src) return false;
+			const url = new URL(src, location.href);
+			return url.origin === location.origin && url.pathname === "/js/index.js";
+		});
+		if (!script) return null;
+		baseColorsRequest = (async () => {
+			try {
+				const response = await fetch(script.src, {
+					credentials: "omit", signal: AbortSignal.timeout(PAINT_REQUEST_TIMEOUT_MS),
+				});
+				if (response.ok) baseColors = parseBasePalette(await response.text());
+			} catch (error) {
+				log("warn", "Palette de base GeoPixels indisponible.", error);
+			}
+			return baseColors;
+		})();
+		try {
+			return await baseColorsRequest;
+		} finally {
+			baseColorsRequest = null;
+		}
 	}
 
 	function getAuthPayload() {
@@ -983,6 +1034,8 @@
 	async function fetchEnergySnapshot() {
 		installPageBridge();
 		try {
+			const accountId = getAuthPayload().userId;
+			const sequence = ++accountReadSequence;
 			let result;
 			if (typeof win.__gpcGetUserData === "function") result = await win.__gpcGetUserData();
 			if (!result || result.needsSession) {
@@ -1002,11 +1055,14 @@
 					data: response.ok ? await response.json() : null,
 				};
 			}
+			const data = result.ok && accountId > 0 && accountId === getAuthPayload().userId &&
+				(result.data?.id == null || normalizeUserId(result.data.id) === accountId) ? result.data : null;
+			if (data) acceptAccountPalette(accountId, data, sequence);
 			return {
 				status: result.status,
 				retryAfter: result.retryAfter,
-				data: result.ok ? result.data : null,
-				energy: result.ok ? energyFromUserData(result.data, result.serverDate) : null,
+				data,
+				energy: energyFromUserData(data, result.serverDate),
 			};
 		} catch (error) {
 			log("warn", "Lecture de l’énergie impossible.", error);
@@ -1364,7 +1420,7 @@
 
 	function settingsSignature() {
 		return [
-			settings.includeFreeColors, settings.includeTransparent, settings.smartPriority,
+			settings.includeFreeColors, settings.includeTransparent, settings.smartPriority, settings.onlyPriorityColors,
 			settings.ignoredColors.join("."), settings.priorityColors.join("."),
 			settings.areas.map((area) => [area.mode, area.x1, area.y1, area.x2, area.y2].join(",")).join(";"),
 		].join("|");
@@ -1388,26 +1444,44 @@
 		if (state.stopRequested) throw new Error("Arrêté");
 	}
 
-	async function analyzeGhost(source) {
-		const { imageData, gridX, gridY } = source;
+	function analyzeImage(imageData) {
+		if (imageAnalysis?.imageData !== imageData) {
+			imageAnalysis = { imageData, pixels: decodeImageColors(imageData), histogram: null };
+		}
+		return imageAnalysis;
+	}
+
+	async function decodeImageColors(imageData) {
 		const { width, data } = imageData;
 		const height = data.length / (4 * width);
-		if (!Number.isSafeInteger(gridX) || !Number.isSafeInteger(gridY) ||
-			!Number.isInteger(width) || width < 1 || !Number.isInteger(height) || height < 1) {
-			throw new Error("Dimensions ou coordonnées du modèle invalides.");
+		if (!Number.isInteger(width) || width < 1 || !Number.isInteger(height) || height < 1) {
+			throw new Error("Dimensions du modèle invalides.");
 		}
 		const length = width * height;
 		const colors = new Int32Array(length);
-		const observed = new Int32Array(length);
 		for (let start = 0; start < length; start += WORK_CHUNK) {
 			const end = Math.min(start + WORK_CHUNK, length);
-			observed.fill(UNKNOWN_COLOR, start, end);
 			for (let index = start; index < end; index++) {
 				const offset = index * 4;
 				colors[index] = data[offset + 3] === 0 ? -1 :
 					(data[offset] << 16) | (data[offset + 1] << 8) | data[offset + 2];
 			}
-			if (end < length) await yieldWork();
+			if (end < length) await delay(0);
+		}
+		return { width, height, colors };
+	}
+
+	async function analyzeGhost(source) {
+		const { imageData, gridX, gridY } = source;
+		if (!Number.isSafeInteger(gridX) || !Number.isSafeInteger(gridY)) {
+			throw new Error("Coordonnées du modèle invalides.");
+		}
+		const { width, height, colors } = await analyzeImage(imageData).pixels;
+		const observed = new Int32Array(colors.length);
+		for (let start = 0; start < colors.length; start += WORK_CHUNK) {
+			const end = Math.min(start + WORK_CHUNK, colors.length);
+			observed.fill(UNKNOWN_COLOR, start, end);
+			if (end < colors.length) await yieldWork();
 		}
 		const west = tileOrigin(gridX);
 		const north = tileOrigin(gridY);
@@ -1538,6 +1612,9 @@
 	async function buildTargets(options = {}) {
 		const source = getGhostSource();
 		if (!source) throw new Error("Chargez et positionnez une image fantôme dans GeoPixels.");
+		if (!settings.includeFreeColors && !baseColors && !await loadBasePalette()) {
+			throw new Error("La palette de base est indisponible. Le filtre des couleurs de base ne peut pas être appliqué.");
+		}
 		const revision = targetRevision;
 		if (!sameGhost(modelCache, source)) {
 			const model = await analyzeGhost(source);
@@ -1550,6 +1627,7 @@
 		const model = modelCache;
 		const filter = settings;
 		const owned = options.monitor ? null : options.owned || getOwnedColorIds();
+		if (!options.monitor && !owned) throw new Error("La palette du compte GeoPixels est en attente de synchronisation.");
 		const paletteKey = owned ? [...owned].sort((a, b) => a - b).join(",") : "?";
 		const key = settingsSignature() + "|" + (options.monitor ? "monitor" : paletteKey);
 		const existing = options.onlyUnowned ? purchaseTargetCache : targetCache;
@@ -1559,6 +1637,8 @@
 		const { colors, width, gridX, gridY } = model;
 		const ignored = new Set(filter.ignoredColors);
 		const priority = new Map(filter.priorityColors.map((id, rank) => [id, rank]));
+		const exclusive = filter.onlyPriorityColors;
+		const skipBase = !filter.includeFreeColors;
 		const includes = filter.areas.filter((area) => area.mode === "include");
 		const excludes = filter.areas.filter((area) => area.mode === "exclude");
 		const inside = (area, x, y) => x >= area.x1 && x <= area.x2 && y >= area.y1 && y <= area.y2;
@@ -1581,10 +1661,9 @@
 					tileSelected = false;
 				}
 				const color = colors[index];
-				const free = FREE_COLOR_IDS.has(color);
-				if ((color === -1 && !filter.includeTransparent) || (free && !filter.includeFreeColors) ||
-					ignored.has(color) || (priority.size && !priority.has(color))) continue;
-				if (options.onlyUnowned ? free || owned.has(color) : owned && !free && !owned.has(color)) continue;
+				if ((color === -1 && !filter.includeTransparent) || (skipBase && baseColors.has(color)) ||
+					ignored.has(color) || (exclusive && !priority.has(color))) continue;
+				if (options.onlyUnowned ? color === -1 || owned.has(color) : owned && color !== -1 && !owned.has(color)) continue;
 				const x = gridX + col;
 				if ((includes.length && !includes.some((area) => inside(area, x, y))) ||
 					(excludes.length && excludes.some((area) => inside(area, x, y)))) continue;
@@ -1594,7 +1673,7 @@
 				}
 				unordered[count++] = index;
 				ranks[index] = 1;
-				if (orderTargets) frequencies.set(color, (frequencies.get(color) ?? 0) + 1);
+				if (!options.onlyUnowned) frequencies.set(color, (frequencies.get(color) ?? 0) + 1);
 			}
 		}
 
@@ -1615,10 +1694,10 @@
 				const regions = await measureRegions(model, indices, ranks);
 				[indices, scratch] = await sortTargetKeys(indices, regions, scratch);
 			}
-			if (priority.size > 1) {
+			if (priority.size > 0) {
 				for (let index = 0; index < count; index++) {
 					const pixel = indices[index];
-					keys[pixel] = priority.get(colors[pixel]);
+					keys[pixel] = priority.get(colors[pixel]) ?? priority.size;
 					if ((index + 1) % WORK_CHUNK === 0) await yieldWork();
 				}
 				[indices] = await sortTargetKeys(indices, keys, scratch);
@@ -1629,7 +1708,7 @@
 		// Un bit par rang représente un pixel observé à peindre. Les compteurs n’ont pas besoin de parcourir ces listes.
 		const cache = {
 			model, key, indices, ranks: count ? ranks : new Uint32Array(0),
-			tiles: [...activeTiles], counts: [0, 0, 0, 0],
+			tiles: [...activeTiles], counts: [0, 0, 0, 0], frequencies,
 			monitor: options.monitor === true,
 			pending: new Uint32Array(orderTargets ? words : 0),
 			wrong: new Uint32Array(orderTargets ? words : 0),
@@ -1725,16 +1804,12 @@
 		}
 	}
 
-	function recordAutomaticPurchase(accountId, ledger, reading) {
+	function recordAutomaticPurchase(accountId, ledger) {
 		const pending = ledger.pending;
 		const spent = ledger.spent + pending.cost;
 		writeAutomaticPurchaseLedger(accountId, { spent, pending: null });
 		autoPurchases.spent = spent;
-		if (pending.type === "ExtraColor") {
-			autoPurchases.palette = { accountId, colors: accountPalette(reading.data) };
-			return true;
-		}
-		return false;
+		return pending.type === "ExtraColor";
 	}
 
 	async function checkAutomaticPurchases(hasPendingPixels, accountId, config) {
@@ -1751,7 +1826,7 @@
 		autoPurchases.spent = ledger.spent;
 		if (ledger.pending) {
 			if (confirmAutomaticPurchase(ledger.pending, reading)) {
-				outcome.colorsChanged = recordAutomaticPurchase(accountId, ledger, reading);
+				outcome.colorsChanged = recordAutomaticPurchase(accountId, ledger);
 				updateAutomaticPurchases("Achat précédent confirmé par le compte.");
 			} else {
 				updateAutomaticPurchases("Achat précédent non confirmé. Achats automatiques suspendus.");
@@ -1859,7 +1934,7 @@
 			updateAutomaticPurchases("Résultat non confirmé" + detail + ". Achats suspendus jusqu’à vérification du compte.", next);
 			return outcome;
 		}
-		outcome.colorsChanged = recordAutomaticPurchase(accountId, { ...ledger, pending: purchase }, outcome.reading);
+		outcome.colorsChanged = recordAutomaticPurchase(accountId, { ...ledger, pending: purchase });
 		outcome.purchased = true;
 		updateAutomaticPurchases(label + " confirmé.");
 		return outcome;
@@ -1949,6 +2024,8 @@
 		colorId = toColorId(colorId);
 		if (colorId === null || colorId === -1) throw new Error("Couleur invalide pour l’achat.");
 		const hex = colorHex(colorId);
+		const accountId = getAuthPayload().userId;
+		if (getOwnedColorIds()?.has(colorId)) return true;
 		setStatus("buying", "Achat de la couleur " + hex + "...");
 		const result = await callPagePurchase("ExtraColor", hex);
 		if (result.status === 402) return "insufficient";
@@ -1957,7 +2034,11 @@
 			return false;
 		}
 
-		purchasedColorIds.add(colorId);
+		const reading = await fetchEnergySnapshot();
+		if (getAuthPayload().userId !== accountId || !accountPalette(reading.data)?.has(colorId)) {
+			setStatus("error", "Achat reçu, mais " + hex + " reste non vérifiée sur le compte.");
+			return false;
+		}
 		return true;
 	}
 
@@ -1966,6 +2047,7 @@
 		let remaining = amount;
 		let bought = 0;
 		let chunkSize = Math.min(remaining, ENERGY_CAPACITY_PURCHASE_CHUNK);
+		let latestEnergy = null;
 
 		while (remaining > 0) {
 			const chunkAmount = Math.min(remaining, chunkSize);
@@ -1999,13 +2081,12 @@
 
 			bought += chunkAmount;
 			remaining -= chunkAmount;
+			latestEnergy = (await fetchEnergySnapshot()).energy;
 			chunkSize = Math.min(remaining, ENERGY_CAPACITY_PURCHASE_CHUNK);
 			if (remaining > 0) await delay(COLOR_PURCHASE_PAUSE_MS);
 		}
 
-		state.energy = null;
-		const reading = await fetchEnergySnapshot();
-		if (!state.running && reading.energy) state.energy = reading.energy;
+		if (!state.running) state.energy = latestEnergy;
 		setStatus("done", "Capacité d’énergie augmentée de " + (bought * 5) + " unités.");
 		updateEnergyDisplay();
 		return true;
@@ -2257,7 +2338,7 @@
 		return state.energy ?? { current: null, capacity: null };
 	}
 
-	async function loadInitialEnergy() {
+	async function refreshAccount() {
 		const auth = getAuthPayload();
 		if (!auth.token || !Number.isFinite(auth.userId)) return;
 		const previous = state.energy;
@@ -2394,6 +2475,7 @@
 	}
 
 	async function startBot() {
+		if (targetPreview) await targetPreview;
 		if (state.running || state.syncing) return;
 		return settings.workMode === "maintenance" ? startMaintenance() : startConstruction();
 	}
@@ -2423,6 +2505,11 @@
 
 		try {
 			setStatus("running", "Préparation de l’image…");
+			if (!getOwnedColorIds()) {
+				const reading = await fetchEnergySnapshot();
+				if (reading.energy) state.energy = reading.energy;
+			}
+			if (state.stopRequested) throw new Error("Arrêté");
 			let syncedCache = await syncBoard();
 			let lastSyncAt = Date.now();
 
@@ -2720,13 +2807,14 @@
 	}
 
 	async function manualSync() {
+		if (targetPreview) await targetPreview;
 		if (state.running || state.syncing) return;
 		state.syncing = true;
 		setButtons();
 		try {
-			await syncBoard({ monitor: settings.workMode === "maintenance" });
 			const reading = await fetchEnergySnapshot();
 			if (reading.energy) state.energy = reading.energy;
+			await syncBoard({ monitor: settings.workMode === "maintenance" });
 			const balance = automaticBalance(reading.data);
 			autoPurchases.balance = balance === null ? null : Math.floor(balance / 5);
 			renderAutomaticPurchases();
@@ -2942,14 +3030,187 @@
 		const rate = observedPaintRate();
 		if (ui.etaText) ui.etaText.textContent = rate && remaining && !unknown ? formatDuration(remaining / rate) : "—";
 		if (ui.rateText) ui.rateText.textContent = rate ? numberFormat.format(rate * 60) + " px/min" : "—";
+		if (ui.paletteSection?.open && paletteView.renderedCache !== targetCache) renderPalette();
 	}
 
-	function renderIgnoredColors() {
-		renderColorChips(ui.ignoredList, settings.ignoredColors);
+	async function countModelColors(analysis) {
+		const { colors } = await analysis.pixels;
+		const counts = new Map();
+		const ids = [];
+		for (let start = 0; start < colors.length; start += WORK_CHUNK) {
+			const end = Math.min(start + WORK_CHUNK, colors.length);
+			for (let index = start; index < end; index++) {
+				const id = colors[index];
+				const count = counts.get(id);
+				if (count === undefined) ids.push(id);
+				counts.set(id, (count ?? 0) + 1);
+			}
+			if (end < colors.length) await delay(0);
+		}
+		return { counts, ids };
 	}
 
-	function renderPriorityColors() {
-		renderColorChips(ui.priorityList, settings.priorityColors);
+	function queueTargetPreview() {
+		const monitor = settings.workMode === "maintenance";
+		if (targetPreview || state.running || state.syncing || !getGhostSource() || (!monitor && !getOwnedColorIds())) return;
+		targetPreview = buildTargets({ monitor }).then(updateProgress).catch((error) => {
+			log("warn", "Aperçu de la sélection indisponible.", error);
+		}).finally(() => { targetPreview = null; });
+	}
+
+	function refreshPaletteModel() {
+		const image = readGlobal("ghostImageOriginalData");
+		const source = getGhostSource();
+		const position = source ? source.gridX + "," + source.gridY : null;
+		const accountId = getAuthPayload().userId;
+		if (accountId !== paletteView.accountId) {
+			paletteView.accountId = accountId;
+			renderPalette();
+			if (accountId > 0 && !getOwnedColorIds() && !state.running && !state.syncing) void refreshAccount();
+			queueTargetPreview();
+		}
+		if (position !== paletteView.position) {
+			paletteView.position = position;
+			queueTargetPreview();
+		}
+		if (image === paletteView.image) return;
+		paletteView.image = image;
+		paletteView.histogram = null;
+		paletteView.page = 0;
+		const request = ++paletteView.request;
+		renderPalette();
+		if (!image?.data) return;
+		const analysis = analyzeImage(image);
+		analysis.histogram ??= countModelColors(analysis);
+		analysis.histogram.then((histogram) => {
+			if (request !== paletteView.request) return;
+			paletteView.histogram = histogram;
+			renderPalette();
+			queueTargetPreview();
+		}).catch((error) => {
+			log("warn", "Analyse de la palette du modèle impossible.", error);
+			if (request === paletteView.request && ui.paletteMessage) ui.paletteMessage.textContent = "Palette du modèle indisponible.";
+		});
+	}
+
+	function renderPalette() {
+		if (!ui.paletteSection?.open) return;
+		paletteView.renderedCache = targetCache;
+		const owned = getOwnedColorIds();
+		const fromAccount = ui.paletteSource.value === "account";
+		const histogram = paletteView.histogram;
+		let ids = (fromAccount ? (owned ? [...new Set([...owned, -1])] : []) : histogram?.ids) ?? [];
+		const query = ui.paletteSearch.value.trim();
+		if (query) {
+			const match = query.match(/^#?([0-9a-f]{6}|00000000)$/i);
+			const id = match ? toColorId("#" + match[1]) : null;
+			const present = fromAccount ? owned && (id === -1 || owned.has(id)) : histogram?.counts.has(id);
+			ids = present ? [id] : [];
+		}
+		const pages = Math.max(1, Math.ceil(ids.length / PALETTE_PAGE_SIZE));
+		paletteView.page = Math.min(paletteView.page, pages - 1);
+		const first = paletteView.page * PALETTE_PAGE_SIZE;
+		const prioritized = new Set(settings.priorityColors);
+		const excluded = new Set(settings.ignoredColors);
+		const selected = targetCache && targetCache.model.imageData === paletteView.image ? targetCache.frequencies : null;
+		const focus = document.activeElement?.dataset;
+		const markup = ids.slice(first, first + PALETTE_PAGE_SIZE).map((id) => {
+			const hex = colorHex(id);
+			const availability = id === -1 ? "Effacement" : !owned ? "Disponibilité inconnue"
+				: !owned.has(id) ? "Manquante" : !baseColors ? "Disponible · type inconnu"
+				: baseColors.has(id) ? "Gratuite · palette de base" : "Débloquée";
+			const count = histogram ? numberFormat.format(histogram.counts.get(id) ?? 0) : "—";
+			const chosen = selected ? " · " + numberFormat.format(selected.get(id) ?? 0) + " retenus" : "";
+			const tone = id !== -1 ? " style=\"--gpc-chip-color:" + hex + "\"" : "";
+			return `<div class="gpc-palette-row">
+				<span class="gpc-swatch"${tone} aria-hidden="true"></span>
+				<div><strong>${hex}</strong> <small>${availability}</small><br><small>${count} px${chosen}</small></div>
+				<div class="gpc-palette-actions">
+					<button class="gpc-btn" type="button" data-color="${id}" data-color-action="priorityColors" aria-label="Priorité ${hex}" aria-pressed="${prioritized.has(id)}">Priorité</button>
+					<button class="gpc-btn" type="button" data-color="${id}" data-color-action="ignoredColors" aria-label="Exclure ${hex}" aria-pressed="${excluded.has(id)}">Exclure</button>
+				</div>
+			</div>`;
+		}).join("");
+		if (ui.paletteList.innerHTML !== markup) {
+			ui.paletteList.innerHTML = markup;
+			if (/^-?\d+$/.test(focus?.color) && ["priorityColors", "ignoredColors"].includes(focus.colorAction)) {
+				ui.paletteList.querySelector('[data-color="' + focus.color + '"][data-color-action="' + focus.colorAction + '"]')
+					?.focus?.({ preventScroll: true });
+			}
+		}
+		ui.palettePage.textContent = (paletteView.page + 1) + " / " + pages;
+		ui.palettePrevious.disabled = paletteView.page === 0;
+		ui.paletteNext.disabled = paletteView.page + 1 >= pages;
+		ui.paletteMessage.textContent = fromAccount && !owned ? "Synchronisation de la palette du compte…"
+			: !fromAccount && !paletteView.image ? "Chargez un modèle ou affichez la palette du compte."
+			: !fromAccount && !histogram ? "Analyse des couleurs du modèle…"
+			: !ids.length ? "Aucune couleur trouvée." : numberFormat.format(ids.length) + (ids.length === 1 ? " couleur" : " couleurs");
+	}
+
+	function bindPalette(panel) {
+		ui.paletteSection = panel.querySelector("#gpc-palette-section");
+		ui.paletteSource = panel.querySelector("#gpc-palette-source");
+		ui.paletteSearch = panel.querySelector("#gpc-palette-search");
+		ui.paletteList = panel.querySelector("#gpc-palette-list");
+		ui.paletteMessage = panel.querySelector("#gpc-palette-message");
+		ui.palettePage = panel.querySelector("#gpc-palette-page");
+		ui.palettePrevious = panel.querySelector("#gpc-palette-previous");
+		ui.paletteNext = panel.querySelector("#gpc-palette-next");
+		const exclusive = panel.querySelector("#gpc-priority-only");
+		ui.paletteSource.value = "model";
+		exclusive.checked = settings.onlyPriorityColors;
+		exclusive.addEventListener("change", () => {
+			settings.onlyPriorityColors = exclusive.checked;
+			applyFiltersChanged();
+		});
+		for (const control of [ui.paletteSource, ui.paletteSearch]) {
+			control.addEventListener(control === ui.paletteSearch ? "input" : "change", () => {
+				paletteView.page = 0;
+				renderPalette();
+			});
+		}
+		ui.palettePrevious.addEventListener("click", () => {
+			paletteView.page = Math.max(0, paletteView.page - 1);
+			renderPalette();
+		});
+		ui.paletteNext.addEventListener("click", () => {
+			paletteView.page++;
+			renderPalette();
+		});
+		panel.querySelector("#gpc-palette-refresh").addEventListener("click", async () => {
+			await Promise.all([loadBasePalette(), refreshAccount()]);
+			refreshPaletteModel();
+			renderPalette();
+			queueTargetPreview();
+		});
+		ui.paletteSection.addEventListener("toggle", () => {
+			if (!ui.paletteSection.open) {
+				if (paletteView.timer !== null) clearInterval(paletteView.timer);
+				paletteView.timer = null;
+				return;
+			}
+			refreshPaletteModel();
+			renderPalette();
+			if (paletteView.timer === null) paletteView.timer = setInterval(refreshPaletteModel, 1000);
+		});
+		ui.paletteList.addEventListener("click", (event) => {
+			const rowButton = event.target.closest("button[data-color-action]");
+			if (!rowButton) return;
+			const { colorAction, color } = rowButton.dataset;
+			if (!["priorityColors", "ignoredColors"].includes(colorAction)) return;
+			const id = Number(color);
+			if (!Number.isInteger(id) || id < -1 || id > 0xFFFFFF) return;
+			const selection = new Set(settings[colorAction]);
+			if (!selection.delete(id)) selection.add(id);
+			settings[colorAction] = [...selection];
+			applyFiltersChanged();
+		});
+		for (const [button, field] of [["#gpc-priority-clear", "priorityColors"], ["#gpc-ignore-clear", "ignoredColors"]]) {
+			panel.querySelector(button).addEventListener("click", () => {
+				settings[field] = [];
+				applyFiltersChanged();
+			});
+		}
 	}
 
 	function areaFromInputs() {
@@ -2970,7 +3231,7 @@
 			return false;
 		}
 		settings.areas.push(normalized);
-		applyFiltersChanged();
+		applyFiltersChanged(true);
 		setStatus(
 			"idle",
 			normalized.mode === "include"
@@ -3001,7 +3262,7 @@
 				remove.textContent = "Retirer";
 				remove.addEventListener("click", () => {
 					settings.areas = settings.areas.filter((candidate) => candidate.id !== area.id);
-					applyFiltersChanged();
+					applyFiltersChanged(true);
 					setStatus("idle", "Zone retirée.");
 				});
 				item.append(title, coordinates, remove);
@@ -3016,29 +3277,13 @@
 		} catch {}
 	}
 
-	function renderColorChips(element, colors) {
-		if (!element) return;
-		if (!colors.length) {
-			element.textContent = "Aucune";
-			return;
-		}
-		element.innerHTML = "";
-		for (const id of colors) {
-			const chip = document.createElement("span");
-			chip.className = "gpc-chip";
-			chip.textContent = colorHex(id);
-			if (id !== -1) chip.style.setProperty("--chip-color", colorHex(id));
-			element.appendChild(chip);
-		}
-	}
-
-	function applyFiltersChanged() {
+	function applyFiltersChanged(redrawAreas = false) {
 		saveSettings();
 		invalidateTargets();
-		renderIgnoredColors();
-		renderPriorityColors();
-		renderAreas();
+		if (redrawAreas) renderAreas();
 		updateProgress();
+		renderPalette();
+		queueTargetPreview();
 	}
 
 	function mountUI() {
@@ -3222,34 +3467,19 @@
 			}
 			.gpc-input:focus { border-color: #14b8a6; }
 			.gpc-muted { color: #94a3b8; font-size: 11px; }
-			#gpc-ignored-list,
-			#gpc-priority-list {
-				display: flex;
-				flex-wrap: wrap;
-				gap: 5px;
-				margin-top: 7px;
-				color: #94a3b8;
-			}
-			.gpc-chip {
-				display: inline-flex;
-				align-items: center;
-				gap: 5px;
-				max-width: 100%;
-				border: 1px solid #334155;
-				border-radius: 999px;
-				padding: 3px 7px;
-				background: #0b1220;
-				color: #dbeafe;
-				font-size: 11px;
-			}
-			.gpc-chip::before {
-				content: "";
-				width: 9px;
-				height: 9px;
-				border-radius: 50%;
-				background: var(--chip-color, transparent);
-				border: 1px solid #475569;
-			}
+			.gpc-palette-tools { flex-wrap: wrap; }
+			.gpc-palette-tools .gpc-input { flex: 1 1 95px; }
+			#gpc-palette-source { flex-basis: 100%; }
+			.gpc-palette-pages { justify-content: space-between; }
+			#gpc-palette-message { margin: 7px 0; }
+			.gpc-palette-row { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 8px; align-items: start; padding: 7px 0; border-bottom: 1px solid #253044; }
+			.gpc-palette-row small { color: #cbd5e1; }
+			.gpc-swatch { width: 20px; height: 20px; border-radius: 4px; border: 1px solid #64748b; background: var(--gpc-chip-color, repeating-conic-gradient(#94a3b8 0% 25%, #293548 0% 50%) 0 / 8px 8px); }
+			.gpc-palette-actions { display: flex; flex-wrap: wrap; gap: 6px; grid-column: 2; }
+			.gpc-palette-actions button[aria-pressed="true"] { background: #164e63; border-color: #38bdf8; }
+			.gpc-palette-filters { margin-bottom: 7px; }
+			.gpc-palette-filters summary { cursor: pointer; }
+			.gpc-palette-filters .gpc-check { margin-top: 5px; }
 			.gpc-area-inputs {
 				display: grid;
 				grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -3419,43 +3649,38 @@
 						<button id="gpc-auto-authorize" class="gpc-btn" type="button"></button>
 					</fieldset>
 				</details>
-				<details class="gpc-section">
-				<summary>Couleurs et priorités</summary>
-				<div class="gpc-row">
-					<label class="gpc-check"><input id="gpc-free" type="checkbox"> Couleurs gratuites</label>
-					<label class="gpc-check"><input id="gpc-alpha" type="checkbox"> Couleurs transparentes</label>
-				</div>
-				<div class="gpc-row">
-					<label class="gpc-check"><input id="gpc-smart-priority" type="checkbox"> Priorité intelligente</label>
-				</div>
-				<div class="gpc-row">
-					<label class="gpc-check"><input id="gpc-wrong-color-priority" type="checkbox"> Corriger les couleurs incorrectes en priorité</label>
-				</div>
-				<div class="gpc-muted" style="margin-top:3px;">Corrige les pixels déjà peints avant de remplir les emplacements vides.</div>
-				<div class="gpc-section">
-					<div class="gpc-muted">Exclure des couleurs</div>
-					<div class="gpc-row" style="margin-top:6px;">
-						<input id="gpc-ignore-input" class="gpc-input" type="text" placeholder="#FF0000, #00FF00">
+				<details class="gpc-section" id="gpc-palette-section">
+					<summary>Palette et filtres</summary>
+					<details class="gpc-palette-filters">
+						<summary>Règles de sélection</summary>
+						<label class="gpc-check"><input id="gpc-priority-only" type="checkbox"> Limiter la sélection aux couleurs prioritaires</label>
+						<label class="gpc-check"><input id="gpc-free" type="checkbox"> Inclure les couleurs de base gratuites</label>
+						<label class="gpc-check"><input id="gpc-alpha" type="checkbox"> Inclure les pixels transparents</label>
+						<div class="gpc-muted">En Construction, inclure la transparence peut effacer des pixels déjà peints.</div>
+						<label class="gpc-check"><input id="gpc-smart-priority" type="checkbox"> Priorité intelligente</label>
+						<label class="gpc-check"><input id="gpc-wrong-color-priority" type="checkbox"> Corriger les couleurs incorrectes en priorité</label>
+					</details>
+					<div class="gpc-row gpc-palette-tools">
+						<select id="gpc-palette-source" class="gpc-input" aria-label="Source des couleurs">
+							<option value="model">Couleurs du modèle</option>
+							<option value="account">Couleurs du compte</option>
+						</select>
+						<input id="gpc-palette-search" class="gpc-input" type="search" placeholder="#123456" aria-label="Code HEX exact">
+						<button id="gpc-palette-refresh" class="gpc-btn" type="button">Actualiser</button>
 					</div>
-					<div class="gpc-row">
-						<button id="gpc-ignore-add" class="gpc-btn gpc-grow" type="button">Ajouter</button>
-						<button id="gpc-ignore-clear" class="gpc-btn gpc-grow" type="button">Effacer</button>
+					<div id="gpc-palette-message" class="gpc-muted" role="status"></div>
+					<div id="gpc-palette-list"></div>
+					<div class="gpc-row gpc-palette-pages">
+						<button id="gpc-palette-previous" class="gpc-btn" type="button">Précédent</button>
+						<span id="gpc-palette-page"></span>
+						<button id="gpc-palette-next" class="gpc-btn" type="button">Suivant</button>
 					</div>
-					<div id="gpc-ignored-list">Aucune</div>
-				</div>
-				<div class="gpc-section">
-					<div class="gpc-muted">Couleurs prioritaires</div>
-					<div class="gpc-muted" style="margin-top:3px;">Si la liste contient des couleurs, seules celles-ci sont peintes.</div>
-					<div class="gpc-row" style="margin-top:6px;">
-						<input id="gpc-priority-input" class="gpc-input" type="text" placeholder="#FF0000, #00FF00">
+					<div class="gpc-row gpc-palette-tools">
+						<button id="gpc-priority-clear" class="gpc-btn" type="button">Effacer les priorités</button>
+						<button id="gpc-ignore-clear" class="gpc-btn" type="button">Effacer les exclusions</button>
 					</div>
-					<div class="gpc-row">
-						<button id="gpc-priority-add" class="gpc-btn gpc-grow" type="button">Ajouter</button>
-						<button id="gpc-priority-clear" class="gpc-btn gpc-grow" type="button">Effacer</button>
-					</div>
-					<div id="gpc-priority-list">Aucune</div>
-				</div>
 				</details>
+
 				<details class="gpc-section">
 					<summary>Zones de peinture</summary>
 					<div class="gpc-muted" style="margin-top:3px;">Les rectangles verts délimitent la peinture. Les rectangles rouges marquent les exclusions.</div>
@@ -3530,14 +3755,6 @@
 		ui.alpha = panel.querySelector("#gpc-alpha");
 		ui.smartPriority = panel.querySelector("#gpc-smart-priority");
 		ui.wrongColorPriority = panel.querySelector("#gpc-wrong-color-priority");
-		ui.ignoreInput = panel.querySelector("#gpc-ignore-input");
-		ui.ignoreAdd = panel.querySelector("#gpc-ignore-add");
-		ui.ignoreClear = panel.querySelector("#gpc-ignore-clear");
-		ui.ignoredList = panel.querySelector("#gpc-ignored-list");
-		ui.priorityInput = panel.querySelector("#gpc-priority-input");
-		ui.priorityAdd = panel.querySelector("#gpc-priority-add");
-		ui.priorityClear = panel.querySelector("#gpc-priority-clear");
-		ui.priorityList = panel.querySelector("#gpc-priority-list");
 		ui.areaMode = panel.querySelector("#gpc-area-mode");
 		ui.areaX1 = panel.querySelector("#gpc-area-x1");
 		ui.areaY1 = panel.querySelector("#gpc-area-y1");
@@ -3556,6 +3773,7 @@
 		ui.wrongColorPriority.checked = !!settings.prioritizeIncorrectColors;
 		bindEnergySettings();
 		bindAutomaticPurchases();
+		bindPalette(panel);
 		const maintenanceInterval = panel.querySelector("#gpc-maintenance-interval");
 		const autoMaintenance = panel.querySelector("#gpc-maintenance-auto");
 		ui.workMode.value = settings.workMode;
@@ -3564,6 +3782,7 @@
 		ui.workMode.addEventListener("change", () => {
 			settings.workMode = ui.workMode.value;
 			saveSettings();
+			queueTargetPreview();
 		});
 		maintenanceInterval.addEventListener("change", () => {
 			settings.maintenanceInterval = normalizeMaintenanceInterval(maintenanceInterval.value);
@@ -3611,48 +3830,6 @@
 					: "Ordre normal de peinture rétabli."
 			);
 		});
-		ui.ignoreAdd.addEventListener("click", () => {
-			const ids = parseColorList(ui.ignoreInput.value);
-			if (!ids.length) {
-				setStatus("idle", "Aucune couleur valide trouvée.");
-				return;
-			}
-			const next = new Set(settings.ignoredColors);
-			for (const id of ids) next.add(id);
-			settings.ignoredColors = [...next];
-			ui.ignoreInput.value = "";
-			applyFiltersChanged();
-			setStatus("idle", settings.ignoredColors.length + " couleur(s) exclue(s).");
-		});
-		ui.ignoreClear.addEventListener("click", () => {
-			settings.ignoredColors = [];
-			applyFiltersChanged();
-			setStatus("idle", "Liste des couleurs exclues effacée.");
-		});
-		ui.ignoreInput.addEventListener("keydown", (event) => {
-			if (event.key === "Enter") ui.ignoreAdd.click();
-		});
-		ui.priorityAdd.addEventListener("click", () => {
-			const ids = parseColorList(ui.priorityInput.value);
-			if (!ids.length) {
-				setStatus("idle", "Aucune couleur valide trouvée.");
-				return;
-			}
-			const next = new Set(settings.priorityColors);
-			for (const id of ids) next.add(id);
-			settings.priorityColors = [...next];
-			ui.priorityInput.value = "";
-			applyFiltersChanged();
-			setStatus("idle", settings.priorityColors.length + " couleur(s) prioritaire(s).");
-		});
-		ui.priorityClear.addEventListener("click", () => {
-			settings.priorityColors = [];
-			applyFiltersChanged();
-			setStatus("idle", "Liste des couleurs prioritaires effacée.");
-		});
-		ui.priorityInput.addEventListener("keydown", (event) => {
-			if (event.key === "Enter") ui.priorityAdd.click();
-		});
 		ui.areaAdd.addEventListener("click", () => {
 			if (addArea(areaFromInputs())) {
 				ui.areaX1.value = "";
@@ -3689,7 +3866,7 @@
 			if (!settings.areas.length) return;
 			if (!win.confirm("Effacer toutes les zones de peinture ?")) return;
 			settings.areas = [];
-			applyFiltersChanged();
+			applyFiltersChanged(true);
 			setStatus("idle", "Toutes les zones ont été effacées.");
 		});
 		ui.buyColors.addEventListener("click", async () => {
@@ -3728,17 +3905,19 @@
 		clampPanelToViewport(false);
 		window.addEventListener("resize", () => clampPanelToViewport(true));
 		window.addEventListener("focus", () => {
-			if (!state.running && !state.syncing && (!state.energy || state.energy.capacity === null)) {
-				void loadInitialEnergy();
+			if (!state.running && !state.syncing) {
+				void refreshAccount();
 			}
 		});
-		renderIgnoredColors();
-		renderPriorityColors();
+		window.addEventListener("gpc-account-purchase", () => {
+			if (!purchaseInFlight) void refreshAccount();
+		});
 		renderAreas();
 		setStatus("idle", "Prêt");
 		setButtons();
 		updateProgress();
-		void loadInitialEnergy();
+		void refreshAccount();
+		void loadBasePalette().then(renderPalette);
 	}
 
 	function clampPanelToViewport(persist) {

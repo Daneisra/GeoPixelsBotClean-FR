@@ -12,6 +12,7 @@ async function fixture({
 	pixels = 20, energy = 10, capacity = 10, settings = {}, bridge = true,
 	balance = 50, rate = 15, palette = [0xFFFFFF], template, ledger, allow = true,
 	templateWidth = pixels, topLeft = { x: 0, y: 0 }, decodedTiles, initialAccountStatus = 200,
+	base = 'let Colors = ["#FFFFFF", "#000000", "#00000000"];',
 } = {}) {
 	const nodes = new Map();
 	const timers = new Map();
@@ -22,6 +23,7 @@ async function fixture({
 	const confirmations = [];
 	const notifications = [];
 	const painted = new Map();
+	const windowEvents = new Map();
 	const account = { energy, capacity, balance, colors: [...palette], paintResponses: [], purchaseResponses: [], status: initialAccountStatus, date: null, tick: 1, rate };
 	const tariffs = { FasterRecharge: 500, EnergyCapacity: 50, Energy: 10, ExtraColor: 100 };
 	const shop = new Map([
@@ -79,12 +81,15 @@ async function fixture({
 	}
 
 	async function fetch(url, init) {
+		if (url === "https://geopixels.net/js/index.js?c=4") return reply(200, base);
 		const body = JSON.parse(init.body);
 		if (url === "/GetUserData") {
-			return reply(account.status, {
+			const response = reply(account.status, {
 				energy: account.reportedEnergy ?? account.energy, maxEnergy: account.capacity, checkedTick: account.tick,
-				energyRate: account.rate, pixels: account.balance * 5, colors: [...account.colors],
+				energyRate: account.rate, pixels: account.balance * 5, colors: [...account.colors], id: account.id ?? 7,
 			}, { Date: account.date, "Retry-After": account.readRetryAfter });
+			await account.delayedReads?.shift();
+			return response;
 		}
 		if (url === "/GetPixelsCached") {
 			tileReads.push(body.Tiles);
@@ -139,7 +144,7 @@ async function fixture({
 
 	const context = vm.createContext({
 		console: { log() {}, warn() {}, error() {} },
-		URL, AbortSignal, fetch, Storage, localStorage: storage,
+		URL, AbortSignal, Event: class { constructor(type) { this.type = type; } }, fetch, Storage, localStorage: storage,
 		Date: class extends Date { static now() { return now; } },
 		Image: class {
 			naturalWidth = 1000;
@@ -148,7 +153,10 @@ async function fixture({
 		},
 		location: new URL("https://geopixels.net/"),
 		innerWidth: 1000, innerHeight: 700,
-		addEventListener() {},
+		addEventListener(type, listener) { windowEvents.set(type, listener); },
+		dispatchEvent(event) { windowEvents.get(event.type)?.(event); },
+		setInterval() { return 1; },
+		clearInterval() {},
 		setTimeout(callback, ms) {
 			if (ms === 0) { queueMicrotask(callback); return 0; }
 			if (ms === 500) return 0; // Le chargement asynchrone de la carte est hors de ce test.
@@ -168,6 +176,7 @@ async function fixture({
 	context.window = context;
 	context.document = {
 		readyState: "complete", createElement,
+		scripts: [{ src: "https://geopixels.net/js/index.js?c=4" }],
 		getElementById(id) {
 			if (id === "freeColorNotice") return {};
 			const quote = shop.get(id);
@@ -189,6 +198,11 @@ async function fixture({
 		maxActiveRequests: () => maxActiveRequests,
 		node: (name) => nodes.get("#gpc-" + name),
 		setTemplate(data) { context.ghostImageOriginalData = { width: templateWidth, data }; },
+		async triggerPagePurchase() {
+			context.dispatchEvent({ type: "gpc-account-purchase" });
+			await flush();
+		},
+		setAccountId(id) { context.userID = id; account.id = id; },
 		elapse(ms) { now += ms; },
 		async advance(expectedMs) {
 			assert.equal(timers.size, 1);
@@ -206,7 +220,7 @@ const sizes = (session, ...expected) => assert.deepEqual(session.requests, expec
 
 test("les salves par défaut attendent la pleine capacité, y compris après une augmentation", async () => {
 	const s = await fixture({ energy: 9, pixels: 15, settings: { minimized: true } });
-	assert.equal(s.bot.version, "1.1.14");
+	assert.equal(s.bot.version, "1.1.15");
 	assert.equal(s.bot.settings().energyMode, "salvos");
 	assert.equal(s.bot.settings().minimized, true);
 	const run = s.bot.start();
@@ -833,4 +847,169 @@ test("un modèle incomplet en raison d’une couleur non acquise ne déclenche p
 	assert.equal(s.node("work-mode").value, "construction");
 	assert.equal(s.node("maintenance-status").textContent, "Inactive");
 	assert.match(s.node("message").textContent, /surveillance automatique reportée/i);
+});
+
+async function openPalette(session) {
+	const section = session.node("palette-section");
+	section.open = true;
+	section.events.toggle();
+	await flush();
+}
+
+function choosePaletteColor(session, id, action) {
+	const button = { dataset: { color: String(id), colorAction: action } };
+	session.node("palette-list").events.click({ target: { closest: () => button } });
+}
+
+test("la palette affiche les couleurs effectivement détenues, celles de base et les couleurs manquantes", async () => {
+	const s = await fixture({
+		pixels: 4, palette: [0x00FF01, 0x123456],
+		base: '// let Colors = ["#123456"];\nlet Colors = ["#00FF01", "#00000000"];',
+		template: new Uint8Array([0, 255, 1, 255, 0, 255, 1, 255, 0x12, 0x34, 0x56, 255, 0x65, 0x43, 0x21, 255]),
+	});
+	await openPalette(s);
+	const list = s.node("palette-list").innerHTML;
+	assert.match(list, /#00FF01<\/strong> <small>Gratuite · palette de base/);
+	assert.match(list, /#123456<\/strong> <small>Débloquée/);
+	assert.match(list, /#654321<\/strong> <small>Manquante/);
+	assert.match(list, /2 px · 2 retenus/);
+	assert.equal(s.node("count").textContent, "0 / 3");
+	assert.equal(s.tileReads.length, 0);
+});
+
+test("la sélection visuelle d’une priorité conserve les autres couleurs et modifie l’ordre d’envoi", async () => {
+	const s = await fixture({
+		pixels: 2, palette: [0xFFFFFF, 0x123456],
+		template: new Uint8Array([255, 255, 255, 255, 0x12, 0x34, 0x56, 255]),
+	});
+	await openPalette(s);
+	choosePaletteColor(s, 0x123456, "priorityColors");
+	await flush();
+	assert.equal(s.node("count").textContent, "0 / 2");
+	assert.match(s.node("palette-list").innerHTML, /aria-label="Priorité #123456" aria-pressed="true"/);
+	await s.bot.start();
+	assert.deepEqual(s.sent, [[[1, 0], [0, 0]]]);
+
+	s.node("priority-only").checked = true;
+	s.node("priority-only").events.change();
+	await flush();
+	assert.equal(s.node("count").textContent, "1 / 1");
+	choosePaletteColor(s, 0x123456, "ignoredColors");
+	await flush();
+	assert.equal(s.node("count").textContent, "0 / 0");
+	assert.match(s.node("palette-list").innerHTML, /aria-label="Exclure #123456" aria-pressed="true"/);
+	const stored = JSON.parse(s.storage.getItem(settingsKey));
+	assert.equal(stored.onlyPriorityColors, true);
+	assert.deepEqual(stored.priorityColors, [0x123456]);
+	assert.deepEqual(stored.ignoredColors, [0x123456]);
+});
+
+test("une liste prioritaire héritée garde son ancien filtrage jusqu’à désactivation explicite", async () => {
+	const s = await fixture({
+		pixels: 2, palette: [0xFFFFFF, 0x123456], settings: { priorityColors: ["#123456"] },
+		template: new Uint8Array([255, 255, 255, 255, 0x12, 0x34, 0x56, 255]),
+	});
+	await openPalette(s);
+	assert.equal(s.node("priority-only").checked, true);
+	assert.equal(s.node("count").textContent, "0 / 1");
+	s.node("priority-only").checked = false;
+	s.node("priority-only").events.change();
+	await flush();
+	assert.equal(s.node("count").textContent, "0 / 2");
+});
+
+test("le filtre de la palette de base ne désactive pas l’effacement", async () => {
+	const s = await fixture({
+		pixels: 2, settings: { includeFreeColors: false, includeTransparent: true },
+		template: new Uint8Array([255, 255, 255, 255, 0, 0, 0, 0]),
+	});
+	await openPalette(s);
+	assert.match(s.node("palette-list").innerHTML, /#00000000<\/strong> <small>Effacement/);
+	assert.equal(s.node("count").textContent, "0 / 1");
+	s.painted.set("1,0", [1, 0, 0xFFFFFF]);
+	await s.bot.start();
+	assert.deepEqual(s.sent, [[[1, 0]]]);
+	assert.equal(s.painted.get("1,0")[2], -1);
+});
+
+test("une palette de base illisible et un compte indisponible ne sont pas remplacés par des suppositions", async () => {
+	const unknown = await fixture({ pixels: 1, initialAccountStatus: 503 });
+	await openPalette(unknown);
+	assert.match(unknown.node("palette-list").innerHTML, /Disponibilité inconnue/);
+	await unknown.bot.start();
+	sizes(unknown);
+	assert.match(unknown.node("message").textContent, /palette du compte.*synchronisation/);
+
+	const base = await fixture({ pixels: 1, base: "let Colors = getPalette();", settings: { includeFreeColors: false } });
+	await openPalette(base);
+	assert.match(base.node("palette-list").innerHTML, /Disponible · type inconnu/);
+	await base.bot.start();
+	sizes(base);
+	assert.match(base.node("message").textContent, /palette de base est indisponible/);
+});
+
+test("un achat du userscript et un achat depuis le site actualisent la palette et les compteurs", async () => {
+	const s = await fixture({
+		pixels: 3,
+		template: new Uint8Array([0x12, 0x34, 0x56, 255, 0x65, 0x43, 0x21, 255, 0xAB, 0xCD, 0xEF, 255]),
+	});
+	await openPalette(s);
+	assert.equal(s.node("count").textContent, "0 / 0");
+	assert.equal(await s.bot.buyColor("#123456"), true);
+	await flush();
+	assert.match(s.node("palette-list").innerHTML, /#123456<\/strong> <small>Débloquée/);
+	assert.equal(s.node("count").textContent, "0 / 1");
+	s.account.purchaseResponses.push({ noEffect: true });
+	assert.equal(await s.bot.buyColor("#654321"), false);
+	assert.match(s.node("palette-list").innerHTML, /#654321<\/strong> <small>Manquante/);
+	s.account.colors.push(0xABCDEF);
+	await s.triggerPagePurchase();
+	assert.match(s.node("palette-list").innerHTML, /#ABCDEF<\/strong> <small>Débloquée/);
+	assert.equal(s.node("count").textContent, "0 / 2");
+});
+
+test("un changement de compte remplace les couleurs vérifiées du compte précédent", async () => {
+	const s = await fixture({
+		pixels: 1, palette: [0x123456], template: new Uint8Array([0x12, 0x34, 0x56, 255]),
+	});
+	await openPalette(s);
+	assert.match(s.node("palette-list").innerHTML, /Débloquée/);
+	s.setAccountId(8);
+	s.account.colors = [];
+	await s.triggerPagePurchase();
+	assert.match(s.node("palette-list").innerHTML, /Manquante/);
+	assert.equal(s.node("count").textContent, "0 / 0");
+});
+
+test("une réponse tardive ne remplace pas une palette plus récente du même compte", async () => {
+	const s = await fixture({ pixels: 1, template: new Uint8Array([0x12, 0x34, 0x56, 255]) });
+	await openPalette(s);
+	let release;
+	s.account.delayedReads = [new Promise((resolve) => { release = resolve; })];
+	await s.triggerPagePurchase();
+	s.account.colors.push(0x123456);
+	await s.triggerPagePurchase();
+	assert.match(s.node("palette-list").innerHTML, /Débloquée/);
+	release();
+	await flush();
+	assert.match(s.node("palette-list").innerHTML, /Débloquée/);
+	assert.equal(s.node("count").textContent, "0 / 1");
+});
+
+test("la palette limite les éléments affichés et retrouve un code HEX indépendamment de la page", async () => {
+	const pixels = 21;
+	const template = new Uint8Array(pixels * 4);
+	for (let index = 0; index < pixels; index++) template.set([0x12, 0x34, index, 255], index * 4);
+	const s = await fixture({ pixels, template });
+	await openPalette(s);
+	assert.equal(s.node("palette-page").textContent, "1 / 2");
+	assert.equal((s.node("palette-list").innerHTML.match(/class="gpc-palette-row"/g) ?? []).length, 20);
+	s.node("palette-next").events.click();
+	assert.equal(s.node("palette-page").textContent, "2 / 2");
+	assert.match(s.node("palette-list").innerHTML, /#123414/);
+	s.node("palette-search").value = "#123401";
+	s.node("palette-search").events.input();
+	assert.equal(s.node("palette-page").textContent, "1 / 1");
+	assert.match(s.node("palette-list").innerHTML, /#123401/);
+	assert.doesNotMatch(s.node("palette-list").innerHTML, /#123414/);
 });

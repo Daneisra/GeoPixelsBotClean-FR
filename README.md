@@ -1,6 +1,6 @@
 # GeoPixelsBotClean-FR
 
-Version française de GhostPixel Bot Clean pour GeoPixels. La version **1.1.14** construit et surveille les images fantômes, suit leur progression et aide à gérer les couleurs et l’énergie. Le script Tampermonkey fonctionne sans serveur supplémentaire. Voir l’[historique des versions](CHANGELOG.md).
+Version française de GhostPixel Bot Clean pour GeoPixels. La version **1.1.15** construit et surveille les images fantômes, suit leur progression et aide à gérer les couleurs et l’énergie. Le script Tampermonkey fonctionne sans serveur supplémentaire. Voir l’[historique des versions](CHANGELOG.md).
 
 ## Installation
 
@@ -10,10 +10,20 @@ Installez Tampermonkey, puis ouvrez [le script du dépôt français](https://raw
 
 1. Connectez-vous à GeoPixels, puis chargez et positionnez votre image fantôme.
 2. Ouvrez le panneau flottant **GhostPixel** et cliquez sur **Synchroniser** pour afficher la progression, l’énergie et le temps estimé.
-3. Choisissez les couleurs et les zones à traiter. Vous pouvez exclure des couleurs, limiter la peinture à une liste de couleurs, privilégier les détails ou corriger d’abord les pixels déjà peints dans une mauvaise couleur. Définissez les zones sur la carte ou saisissez leurs coordonnées.
+3. Choisissez les couleurs dans **Palette et filtres** et les zones à traiter sur la carte. Vous pouvez exclure des couleurs, choisir leur ordre de peinture, limiter la sélection aux prioritaires ou privilégier les détails.
 4. En mode **Construction**, cliquez sur **Démarrer** pour peindre. Le panneau indique si le prochain groupe attend une recharge et affiche une notification à la fin des envois.
 
 Le bouton **Acheter les couleurs manquantes** vérifie les pixels restants dans les zones sélectionnées et demande confirmation avant chaque lot de cinq couleurs au maximum. Le bouton **Augmenter la capacité d’énergie** utilise le solde de pixels disponible pour acheter des unités de capacité.
+
+### Palette et filtres
+
+Alternez entre **Couleurs du modèle** et **Couleurs du compte**. Chaque ligne affiche un aperçu, le code HEX, la disponibilité et le nombre de pixels du modèle. Après le calcul de la sélection, elle indique aussi le nombre de pixels retenus. La palette s’affiche par pages de vingt couleurs. La recherche par code HEX exact et le bouton **Actualiser** restent disponibles.
+
+- **Priorité** fait passer une couleur avant les couleurs sans priorité. **Exclure** la retire de la sélection. Pour peindre ou surveiller uniquement les couleurs prioritaires, activez **Limiter la sélection aux couleurs prioritaires** dans **Règles de sélection**. Une liste prioritaire enregistrée en v1.1.14 ou avant conserve son ancien filtrage lors de la mise à jour. Vous pouvez désactiver ce filtre en gardant vos priorités.
+- **Inclure les couleurs de base gratuites** applique la palette de démarrage publiée par GeoPixels. La liste des couleurs détenues vient du compte et est relue après les achats. Les couleurs non détenues sont indiquées comme manquantes uniquement lorsque le compte a pu être vérifié.
+- **Inclure les pixels transparents** traite la transparence séparément de la palette de base. En Construction, l’option peut effacer des pixels déjà peints.
+
+Les compteurs se recalculent à partir du modèle et des observations en cache lorsque les filtres changent. Pendant la peinture ou la surveillance, ils se recalculent au prochain passage. Si GeoPixels change le format de sa palette de base, les couleurs détenues restent visibles et leur type est indiqué comme inconnu. Le filtre d’exclusion des couleurs de base demande une palette de base vérifiée.
 
 ### Maintenance du modèle
 
